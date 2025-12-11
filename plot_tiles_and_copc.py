@@ -167,45 +167,27 @@ def plot_extents(tindex_path: Path, tile_bounds_json: Path, output_png: Path):
                 fontsize=8, color='darkblue', weight='bold',
                 bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.7))
     
-    # Plot tile extents
+    # Plot tile extents (full bounds including buffer)
     tile_patches = []
     for tile in tiles:
         xmin, ymin, xmax, ymax = tile['bounds']
         width = xmax - xmin
         height = ymax - ymin
         rect = mpatches.Rectangle((xmin, ymin), width, height,
-                                  edgecolor='red', facecolor='none',
-                                  linewidth=2, linestyle='--')
+                                  edgecolor='indianred', facecolor='mistyrose',
+                                  alpha=0.4, linewidth=2)
         tile_patches.append(rect)
         
-        # Add tile label
+        # Add tile label at center
         center_x = (xmin + xmax) / 2
         center_y = (ymin + ymax) / 2
         ax.text(center_x, center_y, tile['label'],
                 ha='center', va='center',
-                fontsize=10, color='red', weight='bold',
-                bbox=dict(boxstyle='round,pad=0.5', facecolor='yellow', alpha=0.8))
+                fontsize=10, color='darkred', weight='bold',
+                bbox=dict(boxstyle='round,pad=0.5', facecolor='white', alpha=0.8))
     
     tile_collection = PatchCollection(tile_patches, match_original=True)
     ax.add_collection(tile_collection)
-    
-    # Plot tile cores if available
-    core_patches = []
-    for tile in tiles:
-        if tile.get('core'):
-            core = tile['core']
-            xmin, xmax = core[0]
-            ymin, ymax = core[1]
-            width = xmax - xmin
-            height = ymax - ymin
-            rect = mpatches.Rectangle((xmin, ymin), width, height,
-                                      edgecolor='darkred', facecolor='pink',
-                                      alpha=0.3, linewidth=1)
-            core_patches.append(rect)
-    
-    if core_patches:
-        core_collection = PatchCollection(core_patches, match_original=True)
-        ax.add_collection(core_collection)
     
     # Set limits and labels
     ax.set_xlim(overall_xmin - x_padding, overall_xmax + x_padding)
@@ -213,16 +195,15 @@ def plot_extents(tindex_path: Path, tile_bounds_json: Path, output_png: Path):
     ax.set_aspect('equal')
     ax.set_xlabel(f'X (Projected CRS: {proj_srs})', fontsize=12)
     ax.set_ylabel(f'Y (Projected CRS: {proj_srs})', fontsize=12)
-    ax.set_title('COPC Files and Generated Tiles\n(Blue = COPC files, Red dashed = Tile bounds, Pink = Tile cores)', 
+    ax.set_title('COPC Files and Generated Tiles\n(Blue = COPC files, Light red = Tiles)', 
                  fontsize=14, weight='bold')
     ax.grid(True, alpha=0.3)
     
     # Add legend
     copc_legend = mpatches.Patch(color='lightblue', alpha=0.5, label='COPC file extent')
-    tile_legend = mpatches.Patch(facecolor='none', edgecolor='red', linestyle='--', 
-                                 linewidth=2, label='Tile extent (with buffer)')
-    core_legend = mpatches.Patch(color='pink', alpha=0.3, label='Tile core (no buffer)')
-    ax.legend(handles=[copc_legend, tile_legend, core_legend], loc='upper right', fontsize=10)
+    tile_legend = mpatches.Patch(facecolor='mistyrose', edgecolor='indianred', 
+                                 alpha=0.4, linewidth=2, label='Tile extent')
+    ax.legend(handles=[copc_legend, tile_legend], loc='upper right', fontsize=10)
     
     # Add statistics text box
     stats_text = f'COPC Files: {len(copc_extents)}\nTiles: {len(tiles)}'
@@ -237,7 +218,7 @@ def plot_extents(tindex_path: Path, tile_bounds_json: Path, output_png: Path):
     plt.savefig(output_png, dpi=300, bbox_inches='tight')
     print(f"\nVisualization saved to: {output_png}")
     print(f"  - {len(copc_extents)} COPC files (blue)")
-    print(f"  - {len(tiles)} tiles (red dashed)")
+    print(f"  - {len(tiles)} tiles (light red)")
     
     # Optionally show plot
     # plt.show()

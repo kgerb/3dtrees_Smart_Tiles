@@ -120,7 +120,7 @@ def load_extent_from_tindex(tindex_path: Path):
         return (geo_minx, geo_miny, geo_maxx, geo_maxy), src_crs
 
 
-def build_tiles(minx, miny, maxx, maxy, length, buffer, align_to_grid=False):
+def build_tiles(minx, miny, maxx, maxy, length, buffer, align_to_grid=False, grid_offset=0.0):
     """Build tile grid.
     
     Args:
@@ -129,17 +129,18 @@ def build_tiles(minx, miny, maxx, maxy, length, buffer, align_to_grid=False):
         buffer: Buffer size in meters
         align_to_grid: If True, snap to grid (floor to nearest tile_length multiple).
                        If False, start from actual data extent (more efficient coverage).
+        grid_offset: Offset in meters to add to minx and miny before starting grid (default: 0.0)
     """
     if align_to_grid:
         # Grid-aligned: snap to multiples of tile_length (ensures consistent grid across datasets)
-        start_x = math.floor(minx / length) * length
-        start_y = math.floor(miny / length) * length
+        start_x = math.floor((minx + grid_offset) / length) * length
+        start_y = math.floor((miny + grid_offset) / length) * length
         end_x = math.ceil(maxx / length) * length
         end_y = math.ceil(maxy / length) * length
     else:
-        # Data-aligned: start from actual data extent (minimizes tiles, better coverage)
-        start_x = minx
-        start_y = miny
+        # Data-aligned: start from actual data extent with offset (minimizes tiles, better coverage)
+        start_x = minx + grid_offset
+        start_y = miny + grid_offset
         end_x = math.ceil((maxx - minx) / length) * length + start_x
         end_y = math.ceil((maxy - miny) / length) * length + start_y
 
@@ -203,6 +204,12 @@ def main():
         default=Path("/home/kg281/data/output/pdal_experiments/tile_bounds_tindex.json"),
         help="Where to write the tile bounds JSON summary",
     )
+    parser.add_argument(
+        "--grid-offset",
+        type=float,
+        default=0.0,
+        help="Offset in meters to add to minx and miny before starting grid (default: 0.0)",
+    )
     args = parser.parse_args()
 
     (geo_minx, geo_miny, geo_maxx, geo_maxy), srs = load_extent_from_tindex(args.tindex_path)
@@ -225,7 +232,8 @@ def main():
     tiles, grid_bounds = build_tiles(
         proj_minx, proj_miny, proj_maxx, proj_maxy, 
         args.tile_length, args.tile_buffer, 
-        align_to_grid=False
+        align_to_grid=False,
+        grid_offset=args.grid_offset
     )
 
     summary = {
