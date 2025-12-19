@@ -28,24 +28,7 @@ def load_copc_extents(tindex_path: Path, target_crs: str = "EPSG:32632"):
     
     with fiona.open(tindex_path) as src:
         # Get source CRS
-        src_crs_dict = src.crs if src.crs else {}
-        if isinstance(src_crs_dict, dict):
-            src_crs = src_crs_dict.get('init') or str(src_crs_dict)
-        else:
-            src_crs = str(src_crs_dict)
-        
-        if not src_crs or src_crs == '{}' or src_crs == '':
-            src_crs = 'EPSG:4326'
-        
-        # Create transformer if needed
-        transformer = None
-        if src_crs != target_crs:
-            try:
-                transformer = Transformer.from_crs(src_crs, target_crs, always_xy=True)
-                print(f"Transforming COPC extents from {src_crs} to {target_crs}")
-            except Exception as e:
-                print(f"WARNING: Could not create transformer: {e}", file=sys.stderr)
-                transformer = None
+        src_crs = str(src.crs) if src.crs else "EPSG:32632"
         
         for feature in src:
             geom = feature['geometry']
@@ -59,24 +42,32 @@ def load_copc_extents(tindex_path: Path, target_crs: str = "EPSG:32632"):
                 continue
             
             xs, ys = zip(*coords)
-            geo_xmin, geo_xmax = min(xs), max(xs)
-            geo_ymin, geo_ymax = min(ys), max(ys)
+            xmin, xmax = min(xs), max(xs)
+            ymin, ymax = min(ys), max(ys)
             
-            # Transform to target CRS if needed
-            if transformer:
-                # Transform all four corners
-                corners = [
-                    transformer.transform(geo_xmin, geo_ymin),
-                    transformer.transform(geo_xmin, geo_ymax),
-                    transformer.transform(geo_xmax, geo_ymin),
-                    transformer.transform(geo_xmax, geo_ymax),
-                ]
-                proj_xs, proj_ys = zip(*corners)
-                xmin, xmax = min(proj_xs), max(proj_xs)
-                ymin, ymax = min(proj_ys), max(proj_ys)
-            else:
-                xmin, xmax = geo_xmin, geo_xmax
-                ymin, ymax = geo_ymin, geo_ymax
+            # Detect if coordinates are already projected (values > 360 are clearly not lat/lon)
+            is_projected = abs(xmin) > 360 or abs(xmax) > 360 or abs(ymin) > 360 or abs(ymax) > 360
+            
+            if is_projected and "4326" in src_crs:
+                # CRS is misreported as WGS84, but coordinates are already projected
+                print(f"Note: CRS reported as {src_crs} but coordinates appear projected (assuming {target_crs})")
+                # Use coordinates as-is
+            elif not is_projected and src_crs != target_crs:
+                # Actually need to transform from geographic to projected
+                try:
+                    transformer = Transformer.from_crs(src_crs, target_crs, always_xy=True)
+                    print(f"Transforming COPC extents from {src_crs} to {target_crs}")
+                    corners = [
+                        transformer.transform(xmin, ymin),
+                        transformer.transform(xmin, ymax),
+                        transformer.transform(xmax, ymin),
+                        transformer.transform(xmax, ymax),
+                    ]
+                    proj_xs, proj_ys = zip(*corners)
+                    xmin, xmax = min(proj_xs), max(proj_xs)
+                    ymin, ymax = min(proj_ys), max(proj_ys)
+                except Exception as e:
+                    print(f"WARNING: Could not transform coordinates: {e}", file=sys.stderr)
             
             extents.append((xmin, ymin, xmax, ymax))
             

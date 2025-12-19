@@ -20,46 +20,25 @@ except ImportError as e:
 
 
 def load_extent_from_tindex(tindex_path: Path):
-    """Load extent from tindex shapefile."""
+    """Load extent from tindex shapefile.
+    
+    Returns:
+        Tuple of (minx, miny, maxx, maxy), crs_string, is_projected
+        
+    The coordinates are returned in the native CRS of the data.
+    is_projected indicates if coordinates are already in a projected CRS.
+    """
     with fiona.open(tindex_path) as src:
-        # Get CRS
-        src_crs_dict = src.crs if src.crs else {}
-        
-        # Handle different CRS formats
-        if isinstance(src_crs_dict, dict):
-            src_crs = src_crs_dict.get('init') or src_crs_dict.get('proj') or str(src_crs_dict)
-        else:
-            src_crs = str(src_crs_dict)
-        
-        # Default to EPSG:32632 if CRS not properly detected
-        if not src_crs or src_crs == '{}' or src_crs == '':
-            src_crs = 'EPSG:32632'
-        elif ':' in src_crs:
-            # Extract EPSG code if present
-            src_crs = src_crs.split(':')[-1] if ':' in src_crs else src_crs
-            if src_crs.isdigit():
-                src_crs = f'EPSG:{src_crs}'
+        # Get CRS from file
+        src_crs = str(src.crs) if src.crs else "EPSG:32632"
         
         # Get bounds of all features
-        proj_minx = proj_miny = math.inf
-        proj_maxx = proj_maxy = -math.inf
-        
-        # Transform to geographic if needed
-        transformer = None
-        if src_crs and src_crs != 'EPSG:4326':
-            try:
-                transformer = Transformer.from_crs(src_crs, "EPSG:4326", always_xy=True)
-            except Exception as e:
-                print(f"WARNING: Could not create transformer from {src_crs}: {e}", file=sys.stderr)
-                transformer = None
-        
-        geo_minx = geo_miny = math.inf
-        geo_maxx = geo_maxy = -math.inf
+        minx = miny = math.inf
+        maxx = maxy = -math.inf
         
         feature_count = 0
         for feature in src:
             feature_count += 1
-            # Get bounds from geometry
             geom = feature['geometry']
             if geom['type'] == 'Polygon':
                 coords = geom['coordinates'][0]
@@ -69,55 +48,28 @@ def load_extent_from_tindex(tindex_path: Path):
                 continue
             
             xs, ys = zip(*coords)
-            fx_min, fx_max = min(xs), max(xs)
-            fy_min, fy_max = min(ys), max(ys)
-            
-            proj_minx = min(proj_minx, fx_min)
-            proj_miny = min(proj_miny, fy_min)
-            proj_maxx = max(proj_maxx, fx_max)
-            proj_maxy = max(proj_maxy, fy_max)
-            
-            # Transform to geographic
-            if transformer:
-                corners = [
-                    transformer.transform(fx_min, fy_min),
-                    transformer.transform(fx_min, fy_max),
-                    transformer.transform(fx_max, fy_min),
-                    transformer.transform(fx_max, fy_max),
-                ]
-                lons, lats = zip(*corners)
-                geo_minx = min(geo_minx, min(lons))
-                geo_miny = min(geo_miny, min(lats))
-                geo_maxx = max(geo_maxx, max(lons))
-                geo_maxy = max(geo_maxy, max(lats))
-            else:
-                # Already in geographic, use as-is
-                geo_minx = min(geo_minx, fx_min)
-                geo_miny = min(geo_miny, fy_min)
-                geo_maxx = max(geo_maxx, fx_max)
-                geo_maxy = max(geo_maxy, fy_max)
+            minx = min(minx, min(xs))
+            miny = min(miny, min(ys))
+            maxx = max(maxx, max(xs))
+            maxy = max(maxy, max(ys))
         
-        # Check if we found any features
         if feature_count == 0:
-            # Try to use bounds from source metadata
             bounds = src.bounds
             if bounds and bounds != (0.0, 0.0, 0.0, 0.0):
-                proj_minx, proj_miny, proj_maxx, proj_maxy = bounds
-                if transformer:
-                    corners = [
-                        transformer.transform(proj_minx, proj_miny),
-                        transformer.transform(proj_maxx, proj_maxy),
-                    ]
-                    geo_minx, geo_miny = corners[0]
-                    geo_maxx, geo_maxy = corners[1]
-                else:
-                    geo_minx, geo_miny = proj_minx, proj_miny
-                    geo_maxx, geo_maxy = proj_maxx, proj_maxy
+                minx, miny, maxx, maxy = bounds
             else:
-                raise ValueError(f"No features found in tindex file: {tindex_path}")
+                raise ValueError(f"No features found in tindex: {tindex_path}")
         
-        # Return geographic bounds and CRS (we'll transform to projected in main)
-        return (geo_minx, geo_miny, geo_maxx, geo_maxy), src_crs
+        # Detect if coordinates are already projected (values > 360 are clearly not lat/lon)
+        is_projected = abs(minx) > 360 or abs(maxx) > 360 or abs(miny) > 360 or abs(maxy) > 360
+        
+        if is_projected and "4326" in src_crs:
+            # CRS is misreported as WGS84, assume EPSG:32632 (UTM 32N)
+            print(f"  Note: CRS reported as {src_crs} but coordinates appear projected", file=sys.stderr)
+            print(f"  Assuming EPSG:32632 (UTM 32N)", file=sys.stderr)
+            src_crs = "EPSG:32632"
+        
+        return (minx, miny, maxx, maxy), src_crs, is_projected
 
 
 def build_tiles(minx, miny, maxx, maxy, length, buffer, align_to_grid=False, grid_offset=0.0):
@@ -212,23 +164,42 @@ def main():
     )
     args = parser.parse_args()
 
-    (geo_minx, geo_miny, geo_maxx, geo_maxy), srs = load_extent_from_tindex(args.tindex_path)
+    (minx, miny, maxx, maxy), srs, is_projected = load_extent_from_tindex(args.tindex_path)
     
-    # Transform geographic bounds to projected CRS for tiling
-    proj_transformer = Transformer.from_crs("EPSG:4326", args.proj_crs, always_xy=True)
+    # Determine the working CRS and coordinates
+    if is_projected:
+        # Coordinates are already projected, use directly
+        proj_minx, proj_miny, proj_maxx, proj_maxy = minx, miny, maxx, maxy
+        proj_crs = srs if srs != "EPSG:4326" else args.proj_crs
+        
+        # Calculate geographic bounds for info
+        try:
+            geo_transformer = Transformer.from_crs(proj_crs, "EPSG:4326", always_xy=True)
+            corners = [
+                geo_transformer.transform(minx, miny),
+                geo_transformer.transform(maxx, maxy),
+            ]
+            geo_minx, geo_miny = corners[0]
+            geo_maxx, geo_maxy = corners[1]
+        except Exception:
+            geo_minx, geo_miny, geo_maxx, geo_maxy = minx, miny, maxx, maxy
+    else:
+        # Coordinates are geographic, transform to projected
+        geo_minx, geo_miny, geo_maxx, geo_maxy = minx, miny, maxx, maxy
+        proj_crs = args.proj_crs
+        
+        proj_transformer = Transformer.from_crs("EPSG:4326", proj_crs, always_xy=True)
+        corners_proj = [
+            proj_transformer.transform(minx, miny),
+            proj_transformer.transform(minx, maxy),
+            proj_transformer.transform(maxx, miny),
+            proj_transformer.transform(maxx, maxy),
+        ]
+        proj_xs, proj_ys = zip(*corners_proj)
+        proj_minx, proj_maxx = min(proj_xs), max(proj_xs)
+        proj_miny, proj_maxy = min(proj_ys), max(proj_ys)
     
-    # Transform all four corners to get projected bounds
-    corners_proj = [
-        proj_transformer.transform(geo_minx, geo_miny),
-        proj_transformer.transform(geo_minx, geo_maxy),
-        proj_transformer.transform(geo_maxx, geo_miny),
-        proj_transformer.transform(geo_maxx, geo_maxy),
-    ]
-    proj_xs, proj_ys = zip(*corners_proj)
-    proj_minx, proj_maxx = min(proj_xs), max(proj_xs)
-    proj_miny, proj_maxy = min(proj_ys), max(proj_ys)
-    
-    # Use data-aligned tiling (starts from actual data extent, more efficient)
+    # Use data-aligned tiling
     tiles, grid_bounds = build_tiles(
         proj_minx, proj_miny, proj_maxx, proj_maxy, 
         args.tile_length, args.tile_buffer, 
@@ -239,7 +210,7 @@ def main():
     summary = {
         "tindex": str(args.tindex_path),
         "tindex_srs": srs,
-        "proj_srs": args.proj_crs,
+        "proj_srs": proj_crs,
         "proj_extent": {"minx": proj_minx, "miny": proj_miny, "maxx": proj_maxx, "maxy": proj_maxy},
         "geo_extent": {"minx": geo_minx, "miny": geo_miny, "maxx": geo_maxx, "maxy": geo_maxy},
         "tile_length": args.tile_length,

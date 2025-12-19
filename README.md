@@ -1,239 +1,232 @@
-# Tile Merger
+# 3DTrees Smart Tiling Pipeline
 
-Merge overlapping segmented point cloud tiles into a single homogeneous point cloud with consistent instance IDs.
-
-TreeDivNet: For the data processing the data was tiled into 200m & 300m tiles with an overlap of 30m in each direction.  
+Point cloud processing pipeline for 3D tree segmentation: tiling, subsampling, remapping, and merging with instance matching.
 
 ## Overview
 
-The tile merger takes **overlapping segmented LAZ tiles** (with potentially different instance segmentations in overlap regions) and produces a **single merged point cloud** where:
-
-- Duplicate points are removed
-- Same physical tree gets the same instance ID across all tiles
-- Small fragments are merged to larger instances
-- Species IDs are preserved from the largest instances
-
-## Pipeline Stages
-
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│  INPUT: Segmented LAZ tiles with overlap (c00_r00.laz, c00_r01.laz, ...)   │
+│                           TILE TASK                                         │
+│  Input LAZ → COPC Conversion → Spatial Index → Tiling → Subsampling        │
+│                                                    ↓                        │
+│                                          2cm and 10cm outputs               │
 └─────────────────────────────────────────────────────────────────────────────┘
-                                      │
-                                      ▼
+                                         ↓
+                              [External Segmentation]
+                                         ↓
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│  STAGE 1: Buffer Zone Filtering                                             │
-│  - Remove instances whose XY centroid is in buffer zone on inner edges      │
-│  - Only affects edges that have neighboring tiles                           │
-│  - Keeps "whole" instances in each tile's core region                       │
-└─────────────────────────────────────────────────────────────────────────────┘
-                                      │
-                                      ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│  STAGE 2: Merge and Deduplicate                                             │
-│  - Concatenate all tile points into single point cloud                      │
-│  - Remove duplicate points (within 1mm tolerance)                           │
-│  - When duplicates exist: keep point with higher instance ID                │
-└─────────────────────────────────────────────────────────────────────────────┘
-                                      │
-                                      ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│  STAGE 3: Cross-Tile Instance Matching                                      │
-│  - Find overlapping tile pairs                                              │
-│  - Compute overlap ratio: max(intersection/size_A, intersection/size_B)     │
-│  - Merge instances if: overlap >= threshold AND centroid_dist < max_dist    │
-│  - Union-Find handles transitive merging (A=B, B=C → A=B=C)                 │
-└─────────────────────────────────────────────────────────────────────────────┘
-                                      │
-                                      ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│  STAGE 4: Small Volume Instance Merging                                     │
-│  - For instances with <10,000 points: calculate convex hull volume          │
-│  - If volume < threshold: merge to nearest large instance by centroid       │
-│  - Species ID always taken from larger instance                             │
-└─────────────────────────────────────────────────────────────────────────────┘
-                                      │
-                                      ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│  STAGE 5: Retile to Original Files (Optional)                               │
-│  - Map merged instance IDs back to original high-resolution tiles           │
-│  - Uses KDTree for efficient point matching                                 │
-└─────────────────────────────────────────────────────────────────────────────┘
-                                      │
-                                      ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│  OUTPUT: Single merged LAZ with PredInstance and species_id                 │
+│                           MERGE TASK                                        │
+│  Segmented 10cm → Remap to 2cm → Merge Tiles → Instance Matching           │
+│                                                    ↓                        │
+│                                          Unified point cloud                │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-## Usage
+## Quick Start with Docker
 
-### Basic Merge
+### Build the Image
 
 ```bash
-./main_merge.sh /path/to/segmented_tiles \
-    --output-merged /path/to/merged.laz
+docker build -t 3dtrees-smart-tile .
 ```
 
-### Full Pipeline with Retiling
+### Tile Task
+
+Convert, tile, and subsample point clouds:
 
 ```bash
-./main_merge.sh /path/to/segmented_tiles \
-    --original-tiles-dir /path/to/original_tiles \
-    --output-merged /path/to/merged.laz \
-    --output-tiles-dir /path/to/retiled_output
+docker run -v /path/to/data:/data 3dtrees-smart-tile \
+    --task tile \
+    --input_dir /data/input \
+    --output_dir /data/output
 ```
 
-### Example with Custom Parameters
+### Merge Task
+
+Remap predictions and merge tiles:
 
 ```bash
-./main_merge.sh /data/segmented_remapped \
-    --output-merged /data/merged.laz \
-    --buffer 15.0 \
-    --overlap-threshold 0.2 \
-    --max-centroid-distance 5.0 \
-    --max-volume-for-merge 6.0 \
-    --verbose
+docker run -v /path/to/data:/data 3dtrees-smart-tile \
+    --task merge \
+    --subsampled_10cm_folder /data/output/tiles_100m/subsampled_10cm
 ```
+
+### View Parameters
+
+```bash
+docker run 3dtrees-smart-tile --show-params
+```
+
+### Interactive Shell
+
+```bash
+docker run -it --entrypoint /bin/bash 3dtrees-smart-tile
+```
+
+## Pipeline Details
+
+### Task: `tile`
+
+1. **COPC Conversion**: Convert to COPC format (optionally strip dimensions to XYZ-only for size reduction)
+2. **Build Spatial Index**: Create tindex for efficient querying
+3. **Tiling**: Create overlapping tiles with configurable buffer
+4. **Subsample Resolution 1**: Default 2cm
+5. **Subsample Resolution 2**: Default 10cm
+
+**Note:** By default, dimensions are reduced to XYZ-only for ~37% size reduction. Use `--skip_dimension_reduction` to preserve all point attributes.
+
+### Task: `merge`
+
+1. **Remap**: Transfer predictions from 10cm back to 2cm resolution
+2. **Buffer Filtering**: Remove instances in overlap zones
+3. **Cross-tile Matching**: Merge instances across tile boundaries
+4. **Deduplication**: Remove duplicate points from overlaps
+5. **Small Volume Merging**: Merge small fragments to nearby trees
 
 ## Parameters
 
+Override defaults via command line:
+
+```bash
+docker run -v /data:/data 3dtrees-smart-tile \
+    --task tile \
+    --input_dir /data/input \
+    --output_dir /data/output \
+    --tile_length 150 \
+    --tile_buffer 10 \
+    --resolution_1 0.03 \
+    --resolution_2 0.1 \
+    --workers 8
+```
+
+See [README_PARAMETERS.md](README_PARAMETERS.md) for full parameter documentation.
+
+### Key Parameters
+
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `--buffer` | 10.0 | Buffer zone distance (meters) for filtering edge instances |
-| `--overlap-threshold` | 0.3 | Minimum overlap ratio (0-1) to merge instances |
-| `--max-centroid-distance` | 3.0 | Maximum centroid distance (meters) to merge instances |
-| `--max-volume-for-merge` | 4.0 | Maximum convex hull volume (m³) for small instance merging |
-| `--num-threads` | 8 | Number of threads for parallel processing |
+| `--tile_length` | 100 | Tile size in meters |
+| `--tile_buffer` | 5 | Buffer overlap in meters |
+| `--resolution_1` | 0.02 | First subsampling resolution (2cm) |
+| `--resolution_2` | 0.1 | Second subsampling resolution (10cm) |
+| `--skip_dimension_reduction` | False | Preserve all point dimensions (disable XYZ-only reduction) |
+| `--workers` | 4 | Number of parallel workers |
+| `--buffer` | 10.0 | Merge buffer distance (meters) |
+| `--overlap_threshold` | 0.3 | Instance matching threshold |
 
-### Optional Flags
+## Local Installation (without Docker)
 
-| Flag | Description |
-|------|-------------|
-| `--disable-matching` | Skip cross-tile instance matching (Stage 3) |
-| `--disable-overlap-check` | Merge based on centroid distance only (ignore overlap ratio) |
-| `--disable-volume-merge` | Skip small volume instance merging (Stage 4) |
-| `--verbose`, `-v` | Print detailed merge decisions |
+### Requirements
+
+- Python 3.10+
+- PDAL >= 2.5
+- pdal_wrench (from [PDAL/wrench](https://github.com/PDAL/wrench))
+- GDAL >= 3.0
+
+### Conda Environment
+
+```bash
+# Create environment
+mamba create -n 3dtrees -c conda-forge \
+    python=3.10 \
+    pdal=2.6 \
+    python-pdal \
+    laspy \
+    lazrs-python \
+    numpy \
+    scipy \
+    matplotlib \
+    fiona \
+    pyproj \
+    geopandas
+
+# Activate
+conda activate 3dtrees
+
+# Build pdal_wrench from source
+git clone https://github.com/PDAL/wrench.git
+cd wrench
+mkdir build && cd build
+cmake ..
+make -j$(nproc)
+sudo cp pdal_wrench /usr/local/bin/
+```
+
+### Run Locally
+
+```bash
+# Tile task
+python src/run.py --task tile --input_dir /path/to/input --output_dir /path/to/output
+
+# Merge task
+python src/run.py --task merge --subsampled_10cm_folder /path/to/10cm
+
+# Show parameters
+python src/run.py --show-params
+```
 
 ## Input Requirements
 
-### File Format
-- LAZ or LAS files
+### Tile Task
 
-### Naming Convention
-Tiles must follow the pattern: `c{col}_r{row}*.laz`
+- LAZ or LAS files in the input directory
+- Files should be in a projected CRS (e.g., UTM)
 
-Examples:
-- `c00_r00_segmented_remapped.laz`
-- `c01_r00_segmented.laz`
-- `c00_r01.laz`
+### Merge Task
 
-### Required Attributes
-- **Instance IDs**: `PredInstance` or `treeID` (int32)
+- Segmented tiles with `PredInstance` attribute
+- Tile naming convention: `c{col}_r{row}*.laz`
 
-### Optional Attributes
-- **Species IDs**: `species_id` (int32)
-
-## Output
-
-### Merged LAZ File
-Single point cloud containing:
-- All unique points (duplicates removed)
-- `PredInstance`: Continuous instance IDs (1, 2, 3, ...)
-- `species_id`: Species IDs preserved from largest instances
-
-### Retiled Files (Optional)
-Original tile files with updated:
-- `PredInstance`: Merged instance IDs
-- `species_id`: Merged species IDs
-
-## Algorithm Details
-
-### Buffer Zone Filtering
-
-Instances are removed if their XY centroid falls within the buffer zone on an edge that has a neighboring tile:
+## Output Structure
 
 ```
-┌──────────────────────────────────────┐
-│            Buffer Zone               │
-│  ┌────────────────────────────────┐  │
-│  │                                │  │
-│  │         Core Region            │  │
-│  │    (instances kept here)       │  │
-│  │                                │  │
-│  └────────────────────────────────┘  │
-│            Buffer Zone               │
-└──────────────────────────────────────┘
-         ↑ Only on edges with neighbors
+output_dir/
+├── copc_xyz/              # XYZ-only COPC files (or copc_full/ if --skip_dimension_reduction)
+├── tiles_100m/            # Tiled point clouds
+│   ├── c00_r00.copc.laz
+│   ├── c00_r01.copc.laz
+│   ├── subsampled_2cm/    # 2cm resolution
+│   └── subsampled_10cm/   # 10cm resolution
+├── tindex_100m.gpkg       # Spatial index
+└── overview_copc_tiles.png # Visualization
 ```
 
-### Overlap Ratio (FF3D-style)
-
-The overlap ratio between two instances is calculated as:
+## Project Structure
 
 ```
-overlap_ratio = max(intersection / size_A, intersection / size_B)
+3dtrees_smart_tile/
+├── src/                          # Python source code
+│   ├── run.py                    # Main orchestrator
+│   ├── main_tile.py              # Tiling pipeline
+│   ├── main_subsample.py         # Subsampling pipeline
+│   ├── main_remap.py             # Prediction remapping
+│   ├── main_merge.py             # Merge wrapper
+│   ├── merge_tiles.py            # Core merge implementation
+│   ├── parameters.py             # Parameter configuration
+│   ├── filter_buffer_instances.py
+│   ├── prepare_tile_jobs.py
+│   ├── get_bounds_from_tindex.py
+│   ├── plot_tiles_and_copc.py
+│   └── example_config.py         # Example parameter config
+├── Dockerfile
+├── docker-compose.yml
+├── README.md
+└── README_PARAMETERS.md
 ```
-
-Where `intersection` is the number of corresponding points (within 5cm tolerance).
-
-This is more lenient than IoU for asymmetric overlaps - if a small instance is fully contained in a larger one, it will still match.
-
-### Species ID Preservation
-
-Throughout all merging operations:
-- When two instances merge, the **species_id from the larger instance** (by point count) is used
-- This ensures taxonomic information is preserved from the most complete segmentation
-
-## Preprocessing (Optional)
-
-For more control, you can pre-filter buffer instances as a separate step:
-
-```bash
-./main_filter_buffer.sh /path/to/segmented_tiles \
-    --output-dir /path/to/filtered \
-    --buffer 10.0
-```
-
-This **removes points entirely** (not just sets instance to 0), useful when you want cleaner tile boundaries before merging.
-
-## Troubleshooting
-
-### Too many instances being merged together
-- Increase `--overlap-threshold` (e.g., 0.5)
-- Decrease `--max-centroid-distance` (e.g., 2.0)
-- Use `--verbose` to see merge decisions
-
-### Instances not merging that should
-- Decrease `--overlap-threshold` (e.g., 0.1)
-- Increase `--max-centroid-distance` (e.g., 5.0)
-- Use `--disable-overlap-check` to merge based on distance only
-
-### Small fragments remaining as separate instances
-- Increase `--max-volume-for-merge` (e.g., 8.0)
-- Check if the fragments are larger than 10,000 points (won't be processed)
-
-### Duplicate points remaining
-- Check if points are truly identical (the deduplication uses 1mm tolerance)
-- Ensure input tiles have consistent coordinate systems
-
-## Files
-
-| File | Description |
-|------|-------------|
-| `main_merge.sh` | Shell wrapper script |
-| `merge_tiles.py` | Main Python implementation |
-| `filter_buffer_instances.py` | Standalone buffer filtering script |
-| `main_filter_buffer.sh` | Shell wrapper for buffer filtering |
-| `parameters.py` | Default parameter configuration |
 
 ## Dependencies
 
-- Python 3.8+
-- numpy
-- laspy (with lazrs backend)
-- scipy
+Core dependencies (installed via Dockerfile or conda):
 
+- **PDAL** >= 2.5 - Point cloud processing
+- **pdal_wrench** - Parallel PDAL operations ([GitHub](https://github.com/PDAL/wrench))
+- **laspy** - LAS/LAZ file handling
+- **scipy** - KDTree for spatial queries
+- **numpy** - Array operations
+- **fiona** - Vector file handling
+- **pyproj** - CRS transformations
+- **matplotlib** - Visualization
 
+## License
 
-
+MIT License

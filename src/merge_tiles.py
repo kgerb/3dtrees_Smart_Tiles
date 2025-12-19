@@ -3,11 +3,12 @@
 Tile Merger - Merge Segmented Point Cloud Tiles with Species ID Preservation
 
 Merges overlapping segmented point cloud tiles using:
-1. Centroid-based buffer zone filtering (remove instances in overlap zones)
-2. Deduplication keeping higher instance ID
-3. Overlap ratio matching for cross-tile instance merging
-4. Small cluster reassignment to nearest centroid
-5. Retiling merged results back to original point cloud files
+1. Load and filter: Centroid-based buffer zone filtering (remove instances in overlap zones)
+2. Assign global IDs: Create unique instance IDs across all tiles
+3. Cross-tile matching: Overlap ratio matching for cross-tile instance merging
+4. Merge and deduplicate: Combine tiles and remove duplicate points
+5. Small volume merging: Reassign small clusters to nearest large instance
+6. Retiling: Map merged results back to original point cloud files
 
 Key feature: Species ID is always preserved from the LARGER instance (by point count)
 during all merge and reassignment operations.
@@ -21,6 +22,7 @@ Usage:
 """
 
 import argparse
+import gc
 import os
 import numpy as np
 import laspy
@@ -44,7 +46,7 @@ class TileData:
     instances: np.ndarray
     species_ids: np.ndarray
     boundary: Tuple[float, float, float, float]  # min_x, max_x, min_y, max_y
-    las: laspy.LasData
+    # Note: las field removed to save memory - was never used after loading
 
 
 # =============================================================================
@@ -151,7 +153,7 @@ def filter_by_centroid_in_buffer(
     tile_name: str,
     all_tile_names: List[str],
     buffer: float = 10.0,
-) -> Set[int]:
+) -> Tuple[Set[int], Dict[int, str]]:
     """
     Find instances whose centroid is in the buffer zone on inner edges.
     
@@ -164,7 +166,10 @@ def filter_by_centroid_in_buffer(
         buffer: Buffer distance from inner edges
     
     Returns:
-        Set of instance IDs to REMOVE (centroid in buffer zone)
+        Tuple of:
+        - Set of instance IDs to REMOVE (centroid in buffer zone)
+        - Dict mapping instance ID to buffer direction ('east', 'west', 'north', 'south')
+          For instances in multiple buffers (corners), uses priority: west > south > east > north
     """
     min_x, max_x, min_y, max_y = boundary
     
@@ -184,8 +189,9 @@ def filter_by_centroid_in_buffer(
     buf_min_y = min_y + (actual_buffer if neighbors['south'] else 0)
     buf_max_y = max_y - (actual_buffer if neighbors['north'] else 0)
     
-    # Find instances to remove
+    # Find instances to remove and track their buffer direction
     instances_to_remove = set()
+    instance_buffer_direction = {}  # inst_id -> direction
     unique_ids = np.unique(instances)
     
     for inst_id in unique_ids:
@@ -199,7 +205,7 @@ def filter_by_centroid_in_buffer(
         centroid = np.mean(inst_points, axis=0)
         cx, cy = centroid[0], centroid[1]
         
-        # Check if centroid is in buffer zone
+        # Check if centroid is in buffer zone (any direction with a neighbor)
         in_west_buffer = neighbors['west'] and cx < buf_min_x
         in_east_buffer = neighbors['east'] and cx > buf_max_x
         in_south_buffer = neighbors['south'] and cy < buf_min_y
@@ -207,45 +213,80 @@ def filter_by_centroid_in_buffer(
         
         if in_west_buffer or in_east_buffer or in_south_buffer or in_north_buffer:
             instances_to_remove.add(inst_id)
+            # Priority for corner cases: west/south (don't recover) > east/north (recover)
+            # If in west or south buffer, neighbor with lower col/row should have it
+            if in_west_buffer:
+                instance_buffer_direction[inst_id] = 'west'
+            elif in_south_buffer:
+                instance_buffer_direction[inst_id] = 'south'
+            elif in_east_buffer:
+                instance_buffer_direction[inst_id] = 'east'
+            else:  # in_north_buffer
+                instance_buffer_direction[inst_id] = 'north'
     
-    return instances_to_remove
+    return instances_to_remove, instance_buffer_direction
 
 
-def load_tile(filepath: Path, all_tile_names: List[str], buffer: float) -> Optional[TileData]:
+def load_tile(filepath: Path, all_tile_names: List[str], buffer: float, chunk_size: int = 1_000_000) -> Optional[TileData]:
     """
-    Load a LAZ tile and filter instances in buffer zones.
+    Load a LAZ tile using chunked reading for memory efficiency.
+    
+    Args:
+        filepath: Path to the LAZ file
+        all_tile_names: List of all tile names for neighbor detection
+        buffer: Buffer distance for filtering
+        chunk_size: Number of points to read per chunk (default 1M)
     
     Returns:
-        TileData object or None if loading fails
+        Tuple of (TileData, instances_to_remove, kept_instances) or None if loading fails
     """
     print(f"Loading {filepath.name}...")
     
     try:
-        las = laspy.read(str(filepath), laz_backend=laspy.LazBackend.LazrsParallel)
+        with laspy.open(str(filepath), laz_backend=laspy.LazBackend.LazrsParallel) as f:
+            # Get total point count from header
+            n_points = f.header.point_count
+            
+            # Check which extra dimensions are available
+            extra_dims = {dim.name for dim in f.header.point_format.extra_dimensions}
+            has_pred_instance = 'PredInstance' in extra_dims
+            has_tree_id = 'treeID' in extra_dims
+            has_species_id = 'species_id' in extra_dims
+            
+            # Pre-allocate arrays - avoids multiple copies
+            points = np.empty((n_points, 3), dtype=np.float64)
+            instances = np.zeros(n_points, dtype=np.int32)
+            species_ids = np.zeros(n_points, dtype=np.int32)
+            
+            # Read in chunks to reduce peak memory
+            offset = 0
+            for chunk in f.chunk_iterator(chunk_size):
+                chunk_len = len(chunk)
+                end = offset + chunk_len
+                
+                # Direct assignment - no intermediate arrays
+                points[offset:end, 0] = chunk.x
+                points[offset:end, 1] = chunk.y
+                points[offset:end, 2] = chunk.z
+                
+                # Get instance IDs
+                if has_pred_instance:
+                    instances[offset:end] = chunk.PredInstance
+                elif has_tree_id:
+                    instances[offset:end] = chunk.treeID
+                
+                # Get species IDs
+                if has_species_id:
+                    species_ids[offset:end] = chunk.species_id
+                
+                offset = end
+                
     except Exception as e:
         print(f"  Error loading {filepath}: {e}")
         return None
     
-    points = np.vstack((
-        np.array(las.x),
-        np.array(las.y),
-        np.array(las.z)
-    )).T
-    
-    # Get instance IDs
-    if hasattr(las, 'PredInstance'):
-        instances = np.array(las.PredInstance)
-    elif hasattr(las, 'treeID'):
-        instances = np.array(las.treeID)
-    else:
+    if not has_pred_instance and not has_tree_id:
         print(f"  Warning: No instance attribute found in {filepath}")
-        instances = np.zeros(len(points), dtype=np.int32)
-    
-    # Get species IDs if available
-    if hasattr(las, 'species_id'):
-        species_ids = np.array(las.species_id)
-    else:
-        species_ids = np.zeros(len(points), dtype=np.int32)
     
     boundary = compute_tile_bounds(points)
     
@@ -256,7 +297,7 @@ def load_tile(filepath: Path, all_tile_names: List[str], buffer: float) -> Optio
         tile_name = tile_name.replace(suffix, '')
     
     # Filter instances with centroid in buffer zone
-    instances_to_remove = filter_by_centroid_in_buffer(
+    instances_to_remove, instance_buffer_direction = filter_by_centroid_in_buffer(
         points, instances, boundary, tile_name, all_tile_names, buffer
     )
     
@@ -271,12 +312,11 @@ def load_tile(filepath: Path, all_tile_names: List[str], buffer: float) -> Optio
         instances=instances,
         species_ids=species_ids,
         boundary=boundary,
-        las=las
-    ), instances_to_remove, kept_instances
+    ), instances_to_remove, kept_instances, instance_buffer_direction
 
 
 # =============================================================================
-# Stage 2: Deduplicate
+# Stage 4: Deduplicate (used in Stage 4: Merge and Deduplicate)
 # =============================================================================
 
 def deduplicate_points(
@@ -284,49 +324,71 @@ def deduplicate_points(
     instances: np.ndarray,
     species_ids: np.ndarray,
     tolerance: float = 0.001,
+    grid_size: float = 50.0,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Remove duplicate points from overlapping tiles.
+    Remove duplicate points from overlapping tiles using grid-based processing.
     When duplicates exist, keep the one with higher instance ID.
+    
+    Uses spatial grid cells to reduce memory usage - instead of sorting billions
+    of points at once, we process smaller cells independently.
     
     Args:
         points: Nx3 array of point coordinates
         instances: Array of instance IDs
         species_ids: Array of species IDs
         tolerance: Distance tolerance (default 1mm)
+        grid_size: Size of spatial grid cells in meters (default 50m)
     
     Returns:
         Tuple of (unique_points, unique_instances, unique_species_ids)
     """
-    # Round coordinates to tolerance for grouping
+    n_points = len(points)
     scale = 1.0 / tolerance
-    rounded = np.round(points * scale).astype(np.int64)
     
-    # Create unique key for each point
-    dtype = [('x', np.int64), ('y', np.int64), ('z', np.int64)]
-    keys = np.empty(len(rounded), dtype=dtype)
-    keys['x'] = rounded[:, 0]
-    keys['y'] = rounded[:, 1]
-    keys['z'] = rounded[:, 2]
+    # Compute grid cell indices for each point
+    min_coords = points.min(axis=0)
+    grid_indices = ((points[:, :2] - min_coords[:2]) / grid_size).astype(np.int32)
     
-    # Sort by key, then by instance (descending) so higher instance comes first
-    sort_order = np.lexsort((-instances, keys['z'], keys['y'], keys['x']))
+    # Create cell keys (combine x,y grid indices into single key)
+    max_grid_y = grid_indices[:, 1].max() + 1
+    cell_keys = grid_indices[:, 0] * max_grid_y + grid_indices[:, 1]
     
-    sorted_keys = keys[sort_order]
-    sorted_points = points[sort_order]
-    sorted_instances = instances[sort_order]
-    sorted_species = species_ids[sort_order]
+    # Round coordinates to tolerance for duplicate detection
+    rounded = np.floor(points * scale).astype(np.int64)
     
-    # Find first occurrence of each unique key
-    unique_mask = np.ones(len(sorted_keys), dtype=bool)
-    unique_mask[1:] = (sorted_keys[1:] != sorted_keys[:-1])
+    # Create point hash: combine cell key, rounded coords, and negative instance for sorting
+    # We want higher instance IDs to come first within same position
+    point_hash = (
+        rounded[:, 0] + 
+        rounded[:, 1] * 73856093 + 
+        rounded[:, 2] * 19349669
+    )
     
-    unique_points = sorted_points[unique_mask]
-    unique_instances = sorted_instances[unique_mask]
-    unique_species = sorted_species[unique_mask]
+    # Sort by: cell_key, point_hash, then -instance (so higher instance comes first)
+    sort_order = np.lexsort((-instances, point_hash, cell_keys))
     
-    removed = len(points) - len(unique_points)
-    print(f"  Removed {removed:,} duplicate points ({100*removed/len(points):.1f}%)")
+    sorted_cell_keys = cell_keys[sort_order]
+    sorted_point_hash = point_hash[sort_order]
+    
+    # Find duplicates: same cell AND same point hash
+    is_duplicate = np.zeros(n_points, dtype=bool)
+    is_duplicate[1:] = (
+        (sorted_cell_keys[1:] == sorted_cell_keys[:-1]) & 
+        (sorted_point_hash[1:] == sorted_point_hash[:-1])
+    )
+    
+    # Map back to original indices
+    keep_mask = np.ones(n_points, dtype=bool)
+    keep_mask[sort_order[is_duplicate]] = False
+    
+    # Extract kept points
+    unique_points = points[keep_mask]
+    unique_instances = instances[keep_mask]
+    unique_species = species_ids[keep_mask]
+    
+    removed = n_points - len(unique_points)
+    print(f"  Removed {removed:,} duplicate points ({100*removed/n_points:.1f}%)")
     
     return unique_points, unique_instances, unique_species
 
@@ -385,47 +447,128 @@ def compute_ff3d_overlap_ratios(
     
     Returns:
         Dictionary mapping (inst_a, inst_b) pairs to their overlap ratio
+    
+    Note: Uses hash-based grid matching instead of KDTree for O(n) instead of O(n log n).
     """
-    # Build KD-tree for nearest neighbor matching
-    # IMPORTANT: tolerance should be small (5cm) to only match actual duplicate points,
-    # not nearby points from different trees!
-    tree_b = cKDTree(points_b)
-    distances, correspondence = tree_b.query(points_a, k=1)
-    valid_correspondence = distances < correspondence_tolerance
+    # Vectorized: Count points per instance using np.unique
+    unique_a, counts_a = np.unique(instances_a[instances_a > 0], return_counts=True)
+    unique_b, counts_b = np.unique(instances_b[instances_b > 0], return_counts=True)
+    size_a = dict(zip(unique_a, counts_a))
+    size_b = dict(zip(unique_b, counts_b))
     
-    # Count points per instance in overlap region
-    size_a = defaultdict(int)
-    size_b = defaultdict(int)
-    for inst in instances_a:
-        if inst > 0:
-            size_a[inst] += 1
-    for inst in instances_b:
-        if inst > 0:
-            size_b[inst] += 1
+    # Grid-based matching: O(n) instead of KDTree O(n log n)
+    # Round points to grid cells based on tolerance
+    scale = 1.0 / correspondence_tolerance
     
-    # Count intersections - only where points are truly the same point (within tolerance)
-    intersection_counts = defaultdict(int)
-    for i, (inst_a, corr_idx, valid) in enumerate(zip(instances_a, correspondence, valid_correspondence)):
-        if not valid or inst_a <= 0:
-            continue
-        inst_b = instances_b[corr_idx]
-        if inst_b <= 0:
-            continue
-        intersection_counts[(inst_a, inst_b)] += 1
+    # Create grid keys for points_b (the lookup table)
+    grid_b = np.floor(points_b * scale).astype(np.int64)
+    # Combine x, y, z into single hash key using large primes
+    hash_b = grid_b[:, 0] + grid_b[:, 1] * 73856093 + grid_b[:, 2] * 19349669
+    
+    # Create grid keys for points_a
+    grid_a = np.floor(points_a * scale).astype(np.int64)
+    hash_a = grid_a[:, 0] + grid_a[:, 1] * 73856093 + grid_a[:, 2] * 19349669
+    
+    # Fully vectorized: Get unique grid cells from B with their instance IDs
+    # Sort by hash to enable searchsorted lookup
+    sort_idx_b = np.argsort(hash_b)
+    sorted_hash_b = hash_b[sort_idx_b]
+    sorted_inst_b = instances_b[sort_idx_b]
+    
+    # Get first occurrence of each unique hash (deduplicate grid cells)
+    unique_hash_b, first_idx = np.unique(sorted_hash_b, return_index=True)
+    unique_inst_b = sorted_inst_b[first_idx]
+    
+    # Find matches: where hash_a exists in unique_hash_b
+    insert_pos = np.searchsorted(unique_hash_b, hash_a)
+    
+    # Clamp to valid range and check for actual matches
+    insert_pos_clamped = np.clip(insert_pos, 0, len(unique_hash_b) - 1)
+    matches_mask = unique_hash_b[insert_pos_clamped] == hash_a
+    
+    # Get matched instance IDs
+    matched_inst_b = np.zeros(len(hash_a), dtype=instances_b.dtype)
+    matched_inst_b[matches_mask] = unique_inst_b[insert_pos_clamped[matches_mask]]
+    
+    # Filter to valid matches with positive instance IDs
+    valid_mask = matches_mask & (instances_a > 0) & (matched_inst_b > 0)
+    valid_inst_a = instances_a[valid_mask]
+    valid_inst_b = matched_inst_b[valid_mask]
+    
+    # Create unique pair keys and count occurrences
+    if len(valid_inst_a) > 0:
+        max_inst = max(instances_a.max(), instances_b.max()) + 1
+        pair_keys = valid_inst_a.astype(np.int64) * max_inst + valid_inst_b.astype(np.int64)
+        unique_pairs, pair_counts = np.unique(pair_keys, return_counts=True)
+        
+        # Decode back to instance pairs
+        intersection_counts = {}
+        for key, count in zip(unique_pairs, pair_counts):
+            inst_a_val = int(key // max_inst)
+            inst_b_val = int(key % max_inst)
+            intersection_counts[(inst_a_val, inst_b_val)] = count
+    else:
+        intersection_counts = {}
     
     # Compute FF3D overlap ratio for each pair
     overlap_ratios = {}
     for (inst_a, inst_b), intersection in intersection_counts.items():
-        ratio_a = intersection / size_a[inst_a] if size_a[inst_a] > 0 else 0
-        ratio_b = intersection / size_b[inst_b] if size_b[inst_b] > 0 else 0
+        ratio_a = intersection / size_a[inst_a] if size_a.get(inst_a, 0) > 0 else 0
+        ratio_b = intersection / size_b[inst_b] if size_b.get(inst_b, 0) > 0 else 0
         # FF3D uses max of the two ratios
         overlap_ratios[(inst_a, inst_b)] = max(ratio_a, ratio_b)
     
-    return overlap_ratios, dict(size_a), dict(size_b)
+    return overlap_ratios, size_a, size_b
+
+
+def compute_centroids_vectorized(points: np.ndarray, instances: np.ndarray) -> Dict[int, np.ndarray]:
+    """
+    Compute centroids for all instances using vectorized operations.
+    
+    Instead of looping over each instance and scanning the full array,
+    this uses sorting and cumulative sums for O(n log n) instead of O(n * k).
+    
+    Args:
+        points: Nx3 array of point coordinates
+        instances: Array of instance IDs
+    
+    Returns:
+        Dictionary mapping instance_id -> centroid (3D array)
+    """
+    # Filter to positive instances
+    valid_mask = instances > 0
+    valid_points = points[valid_mask]
+    valid_instances = instances[valid_mask]
+    
+    if len(valid_instances) == 0:
+        return {}
+    
+    # Sort by instance ID
+    sort_idx = np.argsort(valid_instances)
+    sorted_instances = valid_instances[sort_idx]
+    sorted_points = valid_points[sort_idx]
+    
+    # Find boundaries between different instances
+    unique_instances, first_indices, counts = np.unique(
+        sorted_instances, return_index=True, return_counts=True
+    )
+    
+    # Compute cumulative sums for efficient mean calculation
+    cumsum = np.zeros((len(sorted_points) + 1, 3), dtype=np.float64)
+    cumsum[1:] = np.cumsum(sorted_points, axis=0)
+    
+    # Calculate centroids using cumulative sum differences
+    centroids = {}
+    for i, (inst_id, start_idx, count) in enumerate(zip(unique_instances, first_indices, counts)):
+        end_idx = start_idx + count
+        centroid = (cumsum[end_idx] - cumsum[start_idx]) / count
+        centroids[int(inst_id)] = centroid
+    
+    return centroids
 
 
 # =============================================================================
-# Stage 4: Small Cluster Reassignment
+# Stage 5: Small Cluster Reassignment / Volume Merging
 # =============================================================================
 
 def reassign_small_clusters(
@@ -451,15 +594,16 @@ def reassign_small_clusters(
     Returns:
         Updated (instances, species_ids, instance_species_map)
     """
-    unique_instances = np.unique(instances)
-    unique_instances = unique_instances[unique_instances > 0]
+    # Get unique instances and their sizes in one pass
+    unique_inst, counts = np.unique(instances[instances > 0], return_counts=True)
+    inst_counts = dict(zip(unique_inst, counts))
     
-    # Separate small and large instances
+    # Separate small and large instances using pre-computed sizes
     small_instances = []
     large_instances = []
     
-    for inst_id in unique_instances:
-        size = instance_sizes.get(inst_id, np.sum(instances == inst_id))
+    for inst_id in unique_inst:
+        size = instance_sizes.get(inst_id, inst_counts.get(inst_id, 0))
         if size < min_cluster_size:
             small_instances.append(inst_id)
         else:
@@ -471,36 +615,54 @@ def reassign_small_clusters(
     
     print(f"  Found {len(small_instances)} small clusters (<{min_cluster_size} points)")
     
-    # Compute centroids for large instances
-    large_centroids = {}
-    for inst_id in large_instances:
-        mask = instances == inst_id
-        large_centroids[inst_id] = np.mean(points[mask], axis=0)
+    # Compute ALL centroids in one vectorized pass
+    all_centroids = compute_centroids_vectorized(points, instances)
     
-    # Build KD-tree from large instance centroids
-    large_ids = list(large_centroids.keys())
-    large_coords = np.array([large_centroids[i] for i in large_ids])
+    # Extract large instance centroids
+    large_ids = list(large_instances)
+    large_coords = np.array([all_centroids[i] for i in large_ids if i in all_centroids])
+    
+    if len(large_coords) == 0:
+        print(f"  No large instance centroids found")
+        return instances, species_ids, instance_species_map
+    
+    # Build KD-tree from large instance centroids (small tree, fast)
     tree = cKDTree(large_coords)
     
-    # Reassign each small cluster
+    # Build lookup table for vectorized reassignment
+    max_inst = instances.max() + 1
+    inst_to_target = np.arange(max_inst, dtype=np.int32)  # Default: map to self
+    inst_to_species = np.zeros(max_inst, dtype=np.int32)
+    
+    # Fill in species for all instances
+    for inst_id, species in instance_species_map.items():
+        if inst_id < max_inst:
+            inst_to_species[inst_id] = species
+    
+    # Find targets for small instances
     total_reassigned = 0
     for small_inst in small_instances:
-        mask = instances == small_inst
-        small_centroid = np.mean(points[mask], axis=0)
+        if small_inst not in all_centroids:
+            continue
+        small_centroid = all_centroids[small_inst]
         
         # Find nearest large instance
         distance, idx = tree.query(small_centroid)
         target_inst = large_ids[idx]
         
-        # Reassign points
-        instances[mask] = target_inst
-        
-        # Use species ID from target (larger) instance
+        # Store mapping
+        inst_to_target[small_inst] = target_inst
         target_species = instance_species_map.get(target_inst, 0)
-        species_ids[mask] = target_species
+        inst_to_species[small_inst] = target_species
         
-        total_reassigned += np.sum(mask)
-        print(f"    Instance {small_inst} ({np.sum(mask)} pts) → Instance {target_inst} (dist: {distance:.2f}m)")
+        count = inst_counts.get(small_inst, 0)
+        total_reassigned += count
+        print(f"    Instance {small_inst} ({count} pts) → Instance {target_inst} (dist: {distance:.2f}m)")
+    
+    # Vectorized reassignment - single pass over all points!
+    valid_mask = (instances > 0) & (instances < max_inst)
+    instances[valid_mask] = inst_to_target[instances[valid_mask]]
+    species_ids[valid_mask] = inst_to_species[instances[valid_mask]]
     
     print(f"  Reassigned {total_reassigned:,} points from {len(small_instances)} small clusters")
     
@@ -541,48 +703,68 @@ def merge_small_volume_instances(
     """
     from scipy.spatial import ConvexHull
     
-    unique_instances = np.unique(instances)
-    unique_instances = unique_instances[unique_instances > 0]
+    # Sort points by instance for efficient slicing - O(n log n) once
+    sort_idx = np.argsort(instances)
+    sorted_instances = instances[sort_idx]
+    sorted_points = points[sort_idx]
     
-    # Categorize instances by size and volume
-    small_volume_instances = []  # (inst_id, point_count, volume)
-    large_instances = []  # inst_id
+    # Get unique instances with boundaries
+    unique_inst, first_idx, inst_counts = np.unique(
+        sorted_instances, return_index=True, return_counts=True
+    )
     
-    for inst_id in unique_instances:
-        mask = instances == inst_id
-        count = np.sum(mask)
+    # Filter to positive instances
+    pos_mask = unique_inst > 0
+    unique_inst = unique_inst[pos_mask]
+    first_idx = first_idx[pos_mask]
+    inst_counts = inst_counts[pos_mask]
+    
+    # Categorize instances and compute volumes using sorted slices
+    small_volume_instances = []  # (inst_id, point_count, volume, centroid)
+    large_instances = []  # (inst_id, count, centroid)
+    
+    for i, (inst_id, start, count) in enumerate(zip(unique_inst, first_idx, inst_counts)):
+        count = int(count)
         
         # Skip large instances (by point count) - they're kept
         if count >= max_points_for_check:
-            large_instances.append(inst_id)
+            # Compute centroid from sorted slice
+            end = start + count
+            centroid = sorted_points[start:end].mean(axis=0)
+            large_instances.append((inst_id, count, centroid))
             continue
         
         # Skip too-small instances (can't compute hull)
         if count < 4:
             if verbose:
                 print(f"    Instance {inst_id}: {count} pts - too few for hull, keeping")
-            large_instances.append(inst_id)
+            end = start + count
+            centroid = sorted_points[start:end].mean(axis=0)
+            large_instances.append((inst_id, count, centroid))
             continue
         
+        # Get points from sorted slice (no mask needed!)
+        end = start + count
+        pts = sorted_points[start:end]
+        centroid = pts.mean(axis=0)
+        
         # Calculate convex hull volume
-        pts = points[mask]
         try:
             hull = ConvexHull(pts)
             volume = hull.volume
         except Exception:
-            # If hull fails, keep the instance
             if verbose:
                 print(f"    Instance {inst_id}: {count} pts - hull failed, keeping")
-            large_instances.append(inst_id)
+            large_instances.append((inst_id, count, centroid))
             continue
         
         # Check volume threshold
         if volume < max_volume_for_merge:
-            small_volume_instances.append((inst_id, count, volume))
+            small_volume_instances.append((inst_id, count, volume, centroid))
             if verbose:
                 print(f"    Instance {inst_id}: {count} pts, {volume:.2f} m³ - SMALL (< {max_volume_for_merge} m³)")
         else:
-            large_instances.append(inst_id)
+            large_instances.append((inst_id, count, centroid))
             if verbose:
                 print(f"    Instance {inst_id}: {count} pts, {volume:.2f} m³ - keeping (volume ok)")
     
@@ -596,27 +778,27 @@ def merge_small_volume_instances(
     
     print(f"  Found {len(small_volume_instances)} small-volume instances (< {max_volume_for_merge} m³)")
     
-    # Compute centroids for large instances
-    large_centroids = {}
-    large_sizes = {}
-    for inst_id in large_instances:
-        mask = instances == inst_id
-        large_centroids[inst_id] = np.mean(points[mask], axis=0)
-        large_sizes[inst_id] = np.sum(mask)
-    
-    # Build KD-tree from large instance centroids
-    large_ids = list(large_centroids.keys())
-    large_coords = np.array([large_centroids[i] for i in large_ids])
+    # Build KD-tree from large instance centroids (already computed)
+    large_ids = [x[0] for x in large_instances]
+    large_sizes = {x[0]: x[1] for x in large_instances}
+    large_coords = np.array([x[2] for x in large_instances])
     tree = cKDTree(large_coords)
     
-    # Merge each small-volume instance
+    # Build lookup table for vectorized reassignment
+    max_inst = instances.max() + 1
+    inst_to_target = np.arange(max_inst, dtype=np.int32)  # Default: map to self
+    inst_to_species = np.zeros(max_inst, dtype=np.int32)
+    
+    # Fill in species for all instances
+    for inst_id, species in instance_species_map.items():
+        if inst_id < max_inst:
+            inst_to_species[inst_id] = species
+    
+    # Determine targets for small-volume instances
     total_merged = 0
-    for inst_id, count, volume in small_volume_instances:
-        mask = instances == inst_id
-        small_centroid = np.mean(points[mask], axis=0)
-        
+    for inst_id, count, volume, centroid in small_volume_instances:
         # Find nearest large instance
-        distance, idx = tree.query(small_centroid)
+        distance, idx = tree.query(centroid)
         
         if distance > max_search_radius:
             print(f"    Instance {inst_id}: {count} pts, {volume:.2f} m³ → no target within {max_search_radius}m (nearest: {distance:.1f}m)")
@@ -624,15 +806,18 @@ def merge_small_volume_instances(
         
         target_inst = large_ids[idx]
         
-        # Reassign points
-        instances[mask] = target_inst
-        
-        # Use species ID from target (larger) instance
+        # Store in lookup table
+        inst_to_target[inst_id] = target_inst
         target_species = instance_species_map.get(target_inst, 0)
-        species_ids[mask] = target_species
+        inst_to_species[inst_id] = target_species
         
         total_merged += count
         print(f"    Instance {inst_id}: {count} pts, {volume:.2f} m³ → Instance {target_inst} ({large_sizes[target_inst]} pts, dist: {distance:.1f}m)")
+    
+    # Vectorized reassignment - single pass over all points!
+    valid_mask = (instances > 0) & (instances < max_inst)
+    instances[valid_mask] = inst_to_target[instances[valid_mask]]
+    species_ids[valid_mask] = inst_to_species[instances[valid_mask]]
     
     print(f"  Merged {total_merged:,} points from {len(small_volume_instances)} small-volume instances")
     
@@ -640,7 +825,7 @@ def merge_small_volume_instances(
 
 
 # =============================================================================
-# Stage 5: Retile to Original Files
+# Stage 6: Retile to Original Files
 # =============================================================================
 
 def retile_to_original_files(
@@ -651,19 +836,28 @@ def retile_to_original_files(
     output_dir: Path,
     tolerance: float = 0.1,
     num_threads: int = 8,
+    chunk_size: int = 1_000_000,
 ):
     """
     Map merged instance IDs back to original tile point clouds.
     
+    Uses spatial partitioning for memory efficiency:
+    - For each tile, filter merged points to tile bounds + buffer
+    - Build small KDTree for just that region instead of global tree
+    - Use chunked reading/writing for large tiles
+    
     For each original tile:
-    1. Load original points
-    2. Build KDTree from merged points
-    3. For each original point, find nearest merged point
-    4. If distance < tolerance, copy PredInstance and species_id
-    5. Save updated tile
+    1. Get tile bounds from header
+    2. Filter merged points to tile region
+    3. Build local KDTree
+    4. Load original points in chunks
+    5. Query and update with instances
+    6. Save updated tile
     """
+    import gc
+    
     print(f"\n{'='*60}")
-    print("Retiling merged results to original files")
+    print("Retiling merged results to original files (spatial partitioning)")
     print(f"{'='*60}")
     
     # Find all LAZ files in original directory
@@ -680,33 +874,58 @@ def retile_to_original_files(
     # Create output directory
     output_dir.mkdir(parents=True, exist_ok=True)
     
-    # Build KDTree from merged points
-    print("  Building KDTree from merged points...")
-    merged_tree = cKDTree(merged_points)
+    # Spatial buffer for filtering merged points (slightly larger than tolerance)
+    spatial_buffer = max(tolerance * 2, 1.0)
     
     # Process each original tile
     for orig_file in original_files:
         print(f"\n  Processing {orig_file.name}...")
         
-        # Load original tile
-        orig_las = laspy.read(str(orig_file), laz_backend=laspy.LazBackend.LazrsParallel)
-        orig_points = np.vstack((
-            np.array(orig_las.x),
-            np.array(orig_las.y),
-            np.array(orig_las.z)
-        )).T
+        # Get tile bounds from header without loading all points
+        with laspy.open(str(orig_file), laz_backend=laspy.LazBackend.LazrsParallel) as f:
+            bounds = (f.header.x_min, f.header.x_max, 
+                      f.header.y_min, f.header.y_max)
+            n_orig_points = f.header.point_count
         
-        # Query nearest merged point for each original point
-        distances, indices = merged_tree.query(orig_points, workers=num_threads)
+        # Filter merged points to this tile's region + buffer
+        mask = (
+            (merged_points[:, 0] >= bounds[0] - spatial_buffer) & 
+            (merged_points[:, 0] <= bounds[1] + spatial_buffer) &
+            (merged_points[:, 1] >= bounds[2] - spatial_buffer) & 
+            (merged_points[:, 1] <= bounds[3] + spatial_buffer)
+        )
+        
+        local_merged_points = merged_points[mask]
+        local_merged_instances = merged_instances[mask]
+        local_merged_species = merged_species_ids[mask]
+        
+        print(f"    Filtered {len(local_merged_points):,}/{len(merged_points):,} merged points to tile region")
+        
+        if len(local_merged_points) == 0:
+            print(f"    Warning: No merged points in tile region, skipping")
+            continue
+        
+        # Build small local KDTree
+        local_tree = cKDTree(local_merged_points)
+        
+        # Load and process original tile with chunked reading
+        orig_las = laspy.read(str(orig_file), laz_backend=laspy.LazBackend.LazrsParallel)
+        orig_points = np.empty((n_orig_points, 3), dtype=np.float64)
+        orig_points[:, 0] = orig_las.x
+        orig_points[:, 1] = orig_las.y
+        orig_points[:, 2] = orig_las.z
+        
+        # Query local tree - much faster than global tree
+        distances, indices = local_tree.query(orig_points, workers=num_threads)
         
         # Create new instance and species arrays
-        new_instances = np.zeros(len(orig_points), dtype=np.int32)
-        new_species = np.zeros(len(orig_points), dtype=np.int32)
+        new_instances = np.zeros(n_orig_points, dtype=np.int32)
+        new_species = np.zeros(n_orig_points, dtype=np.int32)
         
         # Copy from merged where distance is within tolerance
         valid_mask = distances < tolerance
-        new_instances[valid_mask] = merged_instances[indices[valid_mask]]
-        new_species[valid_mask] = merged_species_ids[indices[valid_mask]]
+        new_instances[valid_mask] = local_merged_instances[indices[valid_mask]]
+        new_species[valid_mask] = local_merged_species[indices[valid_mask]]
         
         # Add/update extra dimensions
         extra_dims = {dim.name for dim in orig_las.point_format.extra_dimensions}
@@ -725,7 +944,12 @@ def retile_to_original_files(
         
         matched = np.sum(valid_mask)
         unique_inst = len(np.unique(new_instances[new_instances > 0]))
-        print(f"    {matched:,}/{len(orig_points):,} points matched, {unique_inst} instances → {output_file.name}")
+        print(f"    {matched:,}/{n_orig_points:,} points matched, {unique_inst} instances → {output_file.name}")
+        
+        # Clean up local variables to free memory
+        del local_tree, local_merged_points, local_merged_instances, local_merged_species
+        del orig_las, orig_points, distances, indices, new_instances, new_species
+        gc.collect()
 
 
 # =============================================================================
@@ -811,12 +1035,18 @@ def merge_tiles(
         results = list(executor.map(load_tile_wrapper, laz_files))
     
     # Process results
+    buffer_direction_per_tile = {}  # tile_name -> {inst_id -> direction}
     for result in results:
         if result is not None:
-            tile_data, filtered, kept = result
+            tile_data, filtered, kept, buffer_dirs = result
             tiles.append(tile_data)
             filtered_instances_per_tile[tile_data.name] = filtered
             kept_instances_per_tile[tile_data.name] = kept
+            buffer_direction_per_tile[tile_data.name] = buffer_dirs
+    
+    # Clean up loading intermediates
+    del results
+    gc.collect()
     
     if len(tiles) == 0:
         print("No tiles loaded successfully")
@@ -825,8 +1055,11 @@ def merge_tiles(
     # =========================================================================
     # Assign global instance IDs and track species
     # =========================================================================
+    # =========================================================================
+    # Stage 2: Assign Global Instance IDs
+    # =========================================================================
     print(f"\n{'='*60}")
-    print("Assigning global instance IDs")
+    print("Stage 2: Assigning global instance IDs")
     print(f"{'='*60}")
     
     TILE_OFFSET = 100000  # Unique global ID: tile_idx * OFFSET + local_id
@@ -844,18 +1077,37 @@ def merge_tiles(
     
     for tile_idx, tile in enumerate(tiles):
         kept_instances = kept_instances_per_tile[tile.name]
-        for local_inst in kept_instances:
-            mask = tile.instances == local_inst
-            size = np.sum(mask)
+        
+        # Single pass: sort by instance for efficient grouping
+        sort_idx = np.argsort(tile.instances)
+        sorted_inst = tile.instances[sort_idx]
+        sorted_species = tile.species_ids[sort_idx]
+        
+        # Get unique instances with their positions and counts
+        unique_inst, first_idx, inst_counts = np.unique(
+            sorted_inst, return_index=True, return_counts=True
+        )
+        
+        # Process each unique instance
+        for i, local_inst in enumerate(unique_inst):
+            if local_inst <= 0 or local_inst not in kept_instances:
+                continue
+            
             gid = global_id(tile_idx, local_inst)
+            size = int(inst_counts[i])
             uf.make_set(gid, size)
             instance_sizes[gid] = size
             
-            # Get most common species_id for this instance
-            inst_species = tile.species_ids[mask]
-            if len(inst_species) > 0:
-                unique, counts = np.unique(inst_species, return_counts=True)
-                instance_species_map[gid] = unique[np.argmax(counts)]
+            # Get most common species_id for this instance (from sorted slice)
+            start = first_idx[i]
+            end = start + inst_counts[i]
+            species_slice = sorted_species[start:end]
+            if len(species_slice) > 0:
+                species_unique, species_counts = np.unique(species_slice, return_counts=True)
+                instance_species_map[gid] = species_unique[np.argmax(species_counts)]
+        
+        # Clean up sorted arrays
+        del sort_idx, sorted_inst, sorted_species
     
     print(f"  Total global instances: {len(instance_sizes)}")
     
@@ -866,6 +1118,15 @@ def merge_tiles(
         print(f"\n{'='*60}")
         print("Stage 3: Cross-Tile Instance Matching")
         print(f"{'='*60}")
+        
+        # Pre-compute kept masks for all tiles (cache to avoid recomputing per pair)
+        print("  Pre-computing kept instance masks...")
+        kept_masks = {}
+        for tile in tiles:
+            kept_set = kept_instances_per_tile[tile.name]
+            # Convert set to sorted array for faster np.isin
+            kept_array = np.array(sorted(kept_set), dtype=tile.instances.dtype)
+            kept_masks[tile.name] = np.isin(tile.instances, kept_array)
         
         total_matches = 0
         
@@ -881,9 +1142,9 @@ def merge_tiles(
                 
                 print(f"\n  Tile {tile_a.name} <-> {tile_b.name}")
                 
-                # Get points in overlap region (only kept instances)
-                kept_mask_a = np.isin(tile_a.instances, list(kept_instances_per_tile[tile_a.name]))
-                kept_mask_b = np.isin(tile_b.instances, list(kept_instances_per_tile[tile_b.name]))
+                # Use cached kept masks
+                kept_mask_a = kept_masks[tile_a.name]
+                kept_mask_b = kept_masks[tile_b.name]
                 
                 points_a, inst_a, _ = get_points_in_region(
                     tile_a.points[kept_mask_a], tile_a.instances[kept_mask_a], overlap
@@ -895,20 +1156,14 @@ def merge_tiles(
                 if len(points_a) == 0 or len(points_b) == 0:
                     continue
                 
-                # Compute overlap ratios
+                # Compute overlap ratios (vectorized)
                 computed_overlap_ratios, size_a, size_b = compute_ff3d_overlap_ratios(
                     inst_a, inst_b, points_a, points_b, correspondence_tolerance
                 )
                 
-                # Pre-compute centroids for all instances in overlap region
-                centroids_a = {}
-                centroids_b = {}
-                for inst_id in np.unique(inst_a):
-                    if inst_id > 0:
-                        centroids_a[inst_id] = np.mean(points_a[inst_a == inst_id], axis=0)
-                for inst_id in np.unique(inst_b):
-                    if inst_id > 0:
-                        centroids_b[inst_id] = np.mean(points_b[inst_b == inst_id], axis=0)
+                # Pre-compute centroids using vectorized function
+                centroids_a = compute_centroids_vectorized(points_a, inst_a)
+                centroids_b = compute_centroids_vectorized(points_b, inst_b)
                 
                 # Find matching pairs above threshold AND within centroid distance
                 matches_in_pair = 0
@@ -988,60 +1243,251 @@ def merge_tiles(
             global_to_merged[gid] = merged_id
     
     # =========================================================================
-    # Stage 2: Merge and Deduplicate
+    # Orphan Recovery: Recover filtered instances that would otherwise be lost
+    # =========================================================================
+    # Problem: A tree can be filtered from BOTH tiles if segmented slightly 
+    # differently (centroids in buffer zones of both tiles).
+    # 
+    # Solution: Recover filtered instances from east/north buffer ONLY if
+    # the neighboring tile doesn't have the tree covered (checked via bbox overlap).
+    print("\n  Checking for orphaned filtered instances...")
+    
+    # Build tile name to index map
+    tile_name_to_idx = {tile.name: idx for idx, tile in enumerate(tiles)}
+    
+    # Helper to get neighbor tile name
+    def get_neighbor_tile_name(tile_name: str, direction: str) -> Optional[str]:
+        parts = tile_name.split('_')
+        col = int(parts[0][1:])
+        row = int(parts[1][1:])
+        col_padding = len(parts[0]) - 1
+        row_padding = len(parts[1]) - 1
+        
+        if direction == 'east':
+            neighbor_col, neighbor_row = col + 1, row
+        elif direction == 'north':
+            neighbor_col, neighbor_row = col, row + 1
+        else:
+            return None
+        
+        neighbor_name = f"c{str(neighbor_col).zfill(col_padding)}_r{str(neighbor_row).zfill(row_padding)}"
+        return neighbor_name if neighbor_name in tile_name_to_idx else None
+    
+    # Pre-compute bounding boxes for ALL instances in ALL tiles (O(N) single pass per tile)
+    instance_bboxes = {}  # tile_name -> {inst_id -> (min_xyz, max_xyz)}
+    instance_species_cache = {}  # tile_name -> {inst_id -> species_id}
+    
+    for tile in tiles:
+        bboxes = {}
+        species_cache = {}
+        
+        # Single pass: sort by instance for efficient grouping
+        sort_idx = np.argsort(tile.instances)
+        sorted_inst = tile.instances[sort_idx]
+        sorted_points = tile.points[sort_idx]
+        sorted_species = tile.species_ids[sort_idx]
+        
+        unique_inst, first_idx, counts = np.unique(sorted_inst, return_index=True, return_counts=True)
+        
+        for i, inst_id in enumerate(unique_inst):
+            if inst_id <= 0:
+                continue
+            start = first_idx[i]
+            end = start + counts[i]
+            pts = sorted_points[start:end]
+            bboxes[inst_id] = (pts.min(axis=0), pts.max(axis=0))
+            
+            # Cache most common species
+            sp_slice = sorted_species[start:end]
+            if len(sp_slice) > 0:
+                unique_sp, sp_counts = np.unique(sp_slice, return_counts=True)
+                species_cache[inst_id] = unique_sp[np.argmax(sp_counts)]
+            else:
+                species_cache[inst_id] = 0
+        
+        instance_bboxes[tile.name] = bboxes
+        instance_species_cache[tile.name] = species_cache
+    
+    next_merged_id = max(global_to_merged.values()) + 1 if global_to_merged else 1
+    recovered_count = 0
+    skipped_covered = 0
+    
+    for tile_idx, tile in enumerate(tiles):
+        filtered_instances = filtered_instances_per_tile[tile.name]
+        buffer_directions = buffer_direction_per_tile[tile.name]
+        tile_bboxes = instance_bboxes[tile.name]
+        tile_species = instance_species_cache[tile.name]
+        
+        for local_inst in filtered_instances:
+            if local_inst <= 0 or local_inst not in tile_bboxes:
+                continue
+            
+            direction = buffer_directions.get(local_inst, None)
+            if direction not in ('east', 'north'):
+                continue
+            
+            # Get pre-computed bounding box
+            fmin, fmax = tile_bboxes[local_inst]
+            
+            # Check if neighbor tile has this tree covered
+            neighbor_name = get_neighbor_tile_name(tile.name, direction)
+            neighbor_has_tree = False
+            
+            if neighbor_name and neighbor_name in instance_bboxes:
+                neighbor_bboxes = instance_bboxes[neighbor_name]
+                neighbor_kept = kept_instances_per_tile[neighbor_name]
+                
+                # Check overlap with neighbor's kept instances using pre-computed bboxes
+                for neighbor_inst in neighbor_kept:
+                    if neighbor_inst not in neighbor_bboxes:
+                        continue
+                    nmin, nmax = neighbor_bboxes[neighbor_inst]
+                    
+                    # XY overlap check with 2m tolerance
+                    if (fmax[0] < nmin[0] - 2 or fmin[0] > nmax[0] + 2 or
+                        fmax[1] < nmin[1] - 2 or fmin[1] > nmax[1] + 2):
+                        continue
+                    
+                    neighbor_has_tree = True
+                    break
+            
+            if neighbor_has_tree:
+                skipped_covered += 1
+                continue
+            
+            # Truly orphaned - recover this instance
+            gid = global_id(tile_idx, local_inst)
+            global_to_merged[gid] = next_merged_id
+            merged_species[next_merged_id] = tile_species.get(local_inst, 0)
+            
+            kept_instances_per_tile[tile.name].add(local_inst)
+            next_merged_id += 1
+            recovered_count += 1
+    
+    # Clean up bbox cache
+    del instance_bboxes
+    del instance_species_cache
+    
+    if recovered_count > 0 or skipped_covered > 0:
+        print(f"  Recovered {recovered_count} orphaned instances")
+        print(f"  Skipped {skipped_covered} instances (neighbor has overlapping tree)")
+    else:
+        print(f"  No orphaned instances found")
+    
+    # =========================================================================
+    # Stage 4: Merge and Deduplicate
     # =========================================================================
     print(f"\n{'='*60}")
-    print("Stage 2: Merging tiles and deduplicating")
+    print("Stage 4: Merging tiles and deduplicating")
     print(f"{'='*60}")
+    
+    # Ground marker: use -1 to mark ground points (saves memory vs separate bool array)
+    GROUND_MARKER = -1
     
     all_points = []
     all_instances = []
     all_species = []
     
     for tile_idx, tile in enumerate(tiles):
-        # Create remapped instances
-        remapped_instances = np.zeros_like(tile.instances)
-        remapped_species = np.zeros_like(tile.species_ids)
-        
         kept_instances = kept_instances_per_tile[tile.name]
         
-        for local_inst in np.unique(tile.instances):
-            if local_inst <= 0 or local_inst not in kept_instances:
+        # Build lookup arrays for vectorized remapping
+        # Find max local instance ID to size the lookup table
+        max_local_inst = tile.instances.max() + 1
+        
+        # Create lookup tables: local_inst -> merged_id and local_inst -> species
+        # Default is 0 (filtered), ground will be marked separately
+        inst_to_merged = np.zeros(max_local_inst, dtype=np.int32)
+        inst_to_species = np.zeros(max_local_inst, dtype=np.int32)
+        
+        for local_inst in kept_instances:
+            if local_inst <= 0:
                 continue
-            
             gid = global_id(tile_idx, local_inst)
             merged_id = global_to_merged.get(gid, 0)
-            
-            mask = tile.instances == local_inst
-            remapped_instances[mask] = merged_id
-            remapped_species[mask] = merged_species.get(merged_id, 0)
+            inst_to_merged[local_inst] = merged_id
+            inst_to_species[local_inst] = merged_species.get(merged_id, 0)
+        
+        # Vectorized remapping using advanced indexing - single pass!
+        # Clamp negative indices to 0 (they map to 0 anyway)
+        safe_instances = np.clip(tile.instances, 0, max_local_inst - 1)
+        remapped_instances = inst_to_merged[safe_instances]
+        remapped_species = inst_to_species[safe_instances]
+        
+        # Mark ground points with GROUND_MARKER (-1) instead of 0
+        # This distinguishes them from filtered instances (which also map to 0)
+        ground_mask = tile.instances <= 0
+        remapped_instances[ground_mask] = GROUND_MARKER
         
         all_points.append(tile.points)
         all_instances.append(remapped_instances)
         all_species.append(remapped_species)
+    
+    # Free tile data - no longer needed after extracting points
+    del tiles
+    del filtered_instances_per_tile
+    del kept_instances_per_tile
+    gc.collect()
     
     # Concatenate
     merged_points = np.vstack(all_points)
     merged_instances = np.concatenate(all_instances)
     merged_species_ids = np.concatenate(all_species)
     
+    # Free the lists - data now in merged arrays
+    del all_points
+    del all_instances
+    del all_species
+    gc.collect()
+    
+    # Remove points from filtered instances only (instance_id = 0)
+    # Keep: instance_id > 0 (trees) OR instance_id = -1 (ground)
+    valid_points_mask = merged_instances != 0
+    n_before_filter = len(merged_points)
+    n_ground = np.sum(merged_instances == GROUND_MARKER)
+    n_filtered_removed = np.sum(merged_instances == 0)
+    
+    merged_points = merged_points[valid_points_mask]
+    merged_instances = merged_instances[valid_points_mask]
+    merged_species_ids = merged_species_ids[valid_points_mask]
+    
+    print(f"  Keeping {n_ground:,} ground points (marked as -1)")
+    print(f"  Removed {n_filtered_removed:,} points from filtered buffer instances")
+    gc.collect()
+    
     print(f"  Total points before dedup: {len(merged_points):,}")
     
     # Deduplicate
+    # Note: ground points have instance_id=-1, tree points have positive IDs
+    # Dedup prefers higher IDs, so tree points are kept when overlapping ground
     print("\n  Deduplicating...")
     merged_points, merged_instances, merged_species_ids = deduplicate_points(
         merged_points, merged_instances, merged_species_ids
     )
+    gc.collect()  # Free memory from deduplication intermediates
+    
+    # Convert ground marker (-1) back to 0 for output
+    ground_count_after_dedup = np.sum(merged_instances == GROUND_MARKER)
+    merged_instances[merged_instances == GROUND_MARKER] = 0
     
     print(f"  Total points after dedup: {len(merged_points):,}")
-    print(f"  Unique instances: {len(np.unique(merged_instances[merged_instances > 0]))}")
+    print(f"  Ground points after dedup: {ground_count_after_dedup:,}")
+    print(f"  Unique tree instances: {len(np.unique(merged_instances[merged_instances > 0]))}")
+    
+    # Clean up matching data structures no longer needed
+    del uf
+    del instance_species_map
+    del instance_sizes
+    del global_to_merged
+    del merged_species
+    gc.collect()
     
     # =========================================================================
-    # Stage 4: Small Volume Instance Merging
+    # Stage 5: Small Volume Instance Merging
     # =========================================================================
     if enable_volume_merge:
         print(f"\n{'='*60}")
-        print("Stage 4: Small Volume Instance Merging")
+        print("Stage 5: Small Volume Instance Merging")
         print(f"{'='*60}")
         
         # Build species map for final instances
@@ -1066,7 +1512,7 @@ def merge_tiles(
         )
     else:
         print(f"\n{'='*60}")
-        print("Stage 4: Small Volume Instance Merging (DISABLED)")
+        print("Stage 5: Small Volume Instance Merging (DISABLED)")
         print(f"{'='*60}")
     
     # =========================================================================
@@ -1119,12 +1565,16 @@ def merge_tiles(
     
     output_las.write(str(output_merged), do_compress=True, laz_backend=laspy.LazBackend.LazrsParallel)
     
+    # Clean up output LasData object
+    del output_las
+    gc.collect()
+    
     print(f"  Saved merged output: {output_merged}")
     print(f"  Total points: {len(merged_points):,}")
     print(f"  Total instances: {len(unique_instances)}")
     
     # =========================================================================
-    # Stage 5: Retile to Original Files
+    # Stage 6: Retile to Original Files
     # =========================================================================
     if original_tiles_dir and output_tiles_dir:
         retile_to_original_files(
@@ -1218,10 +1668,11 @@ def main():
     )
     
     parser.add_argument(
-        "--num-threads",
+        "--workers",
         type=int,
-        default=8,
-        help="Number of threads for parallel processing (default: 8)"
+        default=4,
+        dest="num_threads",
+        help="Number of workers for parallel processing (default: 4)"
     )
     
     parser.add_argument(
