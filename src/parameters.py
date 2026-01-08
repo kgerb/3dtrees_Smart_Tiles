@@ -24,8 +24,8 @@ TILE_PARAMS = {
     'resolution_1': 0.02,         # First resolution in meters (2cm)
     'resolution_2': 0.1,          # Second resolution in meters (10cm)
     'grid_offset': 1.0,           # Grid offset in meters
-    'skip_dimension_reduction': False,  # Skip XYZ-only reduction, keep all dimensions
-    # num_spatial_chunks: defaults to workers (auto-calculated)
+    'dimension_reduction': True,  # Enable XYZ-only reduction (default: True)
+    # Note: 'threads' is used for number of spatial chunks per file in subsampling
     # Legacy names (for backwards compatibility)
     'resolution_2cm': 0.02,
     'resolution_10cm': 0.1,
@@ -33,8 +33,7 @@ TILE_PARAMS = {
 
 # Default remap task parameters
 REMAP_PARAMS = {
-    'target_resolution_cm': 2,    # Target resolution in cm (default: 2cm, configurable)
-    'workers': 4,                 # Number of parallel workers for KDTree queries
+    'tolerance': 5.0,             # Bounds matching tolerance in meters (default: 5.0)
 }
 
 # Default merge task parameters
@@ -156,8 +155,8 @@ def parse_param_override(param_str: str) -> tuple[str, str, Any]:
 def _infer_category(param_name: str) -> str:
     """Infer parameter category from parameter name."""
     tile_params = ['tile_length', 'tile_buffer', 'threads', 'workers', 
-                   'resolution_1', 'resolution_2', 'grid_offset', 'skip_dimension_reduction']
-    remap_params = ['target_resolution_cm']
+                   'resolution_1', 'resolution_2', 'grid_offset', 'dimension_reduction']
+    remap_params = ['tolerance']
     
     if param_name in tile_params:
         return 'TILE_PARAMS'

@@ -4,11 +4,14 @@ Main orchestrator script for the 3DTrees smart tiling pipeline.
 
 Routes to appropriate task modules based on --task parameter:
 - tile: XYZ reduction, COPC conversion, tiling, and subsampling (2cm and 10cm)
-- merge: Remap predictions and merge tiles with instance matching
+- remap: Remap predictions from source files to target files by matching spatial bounds
+- merge: Merge tiles with instance matching (optionally includes remap step)
 
 Usage:
     python run.py --task tile --input_dir /path/to/input --output_dir /path/to/output
-    python run.py --task merge --subsampled_10cm_folder /path/to/subsampled_10cm
+    python run.py --task remap --source_folder /path/to/segmented --target_folder /path/to/2cm --output_folder /path/to/output
+    python run.py --task merge --segmented_remapped_folder /path/to/segmented_remapped \\
+      --output_tiles_folder /path/to/output_tiles --original_tiles_dir /path/to/original_tiles
 """
 
 import argparse
@@ -67,9 +70,16 @@ def run_tile_task(args, params):
     threads = args.threads if args.threads else params.get('threads', 5)
     workers = args.workers if args.workers else params.get('workers', 4)
     grid_offset = args.grid_offset if args.grid_offset else params.get('grid_offset', 1.0)
-    skip_dimension_reduction = args.skip_dimension_reduction if hasattr(args, 'skip_dimension_reduction') and args.skip_dimension_reduction else params.get('skip_dimension_reduction', False)
-    # num_spatial_chunks defaults to workers (one chunk per worker)
-    num_spatial_chunks = args.num_spatial_chunks if args.num_spatial_chunks else None  # None means auto = workers
+    # Handle dimension_reduction parameter
+    # CLI: --dimension_reduction true/false (boolean argument)
+    # If provided, overrides parameter file setting
+    # Default: uses TILE_PARAMS value (typically True = XYZ-only reduction)
+    if hasattr(args, 'dimension_reduction') and args.dimension_reduction is not None:
+        dimension_reduction = args.dimension_reduction
+    else:
+        dimension_reduction = params.get('dimension_reduction', True)
+    # num_threads for subsampling (number of spatial chunks per file)
+    # Uses the same threads parameter as COPC writing
     res1 = params.get('resolution_1', 0.02)
     res2 = params.get('resolution_2', 0.1)
     
@@ -83,7 +93,9 @@ def run_tile_task(args, params):
     print(f"Grid offset: {grid_offset}m")
     print(f"Workers: {workers}")
     print(f"Threads per writer: {threads}")
-    print(f"Skip dimension reduction: {skip_dimension_reduction}")
+    print(f"Dimension reduction: {dimension_reduction}")
+    if not dimension_reduction:
+        print("  → Extra dimensions (e.g., PredInstance) will be preserved")
     print(f"Resolutions: {res1}m ({int(res1*100)}cm), {res2}m ({int(res2*100)}cm)")
     print()
     
@@ -98,7 +110,7 @@ def run_tile_task(args, params):
             num_workers=workers,
             threads=threads,
             max_tile_procs=workers,
-            skip_dimension_reduction=skip_dimension_reduction
+            dimension_reduction=dimension_reduction
         )
         
         # Step 5-6: Subsampling pipeline
@@ -108,7 +120,7 @@ def run_tile_task(args, params):
             res1=res1,
             res2=res2,
             num_cores=workers,
-            num_spatial_chunks=num_spatial_chunks,
+            num_threads=threads,
             output_prefix=output_prefix
         )
         
@@ -122,6 +134,78 @@ def run_tile_task(args, params):
         
     except Exception as e:
         print(f"Error: {e}")
+        sys.exit(1)
+
+
+def run_remap_task(args, params):
+    """
+    Run the remap task: remap predictions by matching spatial bounds.
+    
+    Matches files between source and target folders by comparing spatial boundaries,
+    then transfers predictions from source to target using KDTree nearest neighbor.
+    """
+    # Import Python modules
+    try:
+        from main_remap import remap_all_tiles
+    except ImportError as e:
+        print(f"Error: Could not import required modules: {e}")
+        print("Make sure main_remap.py exists.")
+        sys.exit(1)
+    
+    # Required arguments
+    if not args.source_folder:
+        print("Error: --source_folder is required for remap task")
+        sys.exit(1)
+    if not args.target_folder:
+        print("Error: --target_folder is required for remap task")
+        sys.exit(1)
+    if not args.output_folder:
+        print("Error: --output_folder is required for remap task")
+        sys.exit(1)
+    
+    # Validate directories
+    source_folder = Path(args.source_folder)
+    target_folder = Path(args.target_folder)
+    output_folder = Path(args.output_folder)
+    
+    if not source_folder.exists():
+        print(f"Error: Source directory does not exist: {source_folder}")
+        sys.exit(1)
+    
+    if not target_folder.exists():
+        print(f"Error: Target directory does not exist: {target_folder}")
+        sys.exit(1)
+    
+    # Get tolerance from args or params
+    tolerance = args.tolerance if args.tolerance is not None else REMAP_PARAMS.get('tolerance', 5.0)
+    
+    print("=" * 60)
+    print("Running Remap Task")
+    print("=" * 60)
+    print(f"Source folder: {source_folder}")
+    print(f"Target folder: {target_folder}")
+    print(f"Output folder: {output_folder}")
+    print(f"Bounds tolerance: {tolerance}m")
+    print()
+    
+    try:
+        output_folder_result = remap_all_tiles(
+            source_folder=source_folder,
+            target_folder=target_folder,
+            output_folder=output_folder,
+            tolerance=tolerance
+        )
+        
+        print()
+        print("=" * 60)
+        print("Remap Task Complete")
+        print("=" * 60)
+        print(f"Remapped files: {output_folder_result}")
+        
+    except Exception as e:
+        print(f"Error: {e}")
+        import traceback
+        traceback.print_exc()
         sys.exit(1)
 
 
@@ -142,47 +226,66 @@ def run_merge_task(args, params):
         print("Make sure main_remap.py and main_merge.py exist.")
         sys.exit(1)
     
-    # Required arguments - need either subsampled_10cm_folder or segmented_remapped_folder
-    if not args.subsampled_10cm_folder and not args.segmented_remapped_folder:
-        print("Error: --subsampled_10cm_folder or --segmented_remapped_folder is required for merge task")
+    # Required arguments - need segmented_remapped_folder
+    # Optionally can provide source/target folders for remap step
+    if not args.segmented_remapped_folder and not (args.source_folder and args.target_folder):
+        print("Error: --segmented_remapped_folder is required for merge task")
+        print("  OR provide --source_folder and --target_folder to remap first")
         sys.exit(1)
     
     # Get parameters
-    target_resolution = args.target_resolution if args.target_resolution else params.get('target_resolution_cm', 2)
     workers = args.workers if args.workers else MERGE_PARAMS.get('workers', 4)
     buffer = args.buffer if args.buffer is not None else MERGE_PARAMS.get('buffer', 10.0)
     overlap_threshold = args.overlap_threshold if args.overlap_threshold is not None else MERGE_PARAMS.get('overlap_threshold', 0.3)
     max_centroid_distance = MERGE_PARAMS.get('max_centroid_distance', 3.0)
     correspondence_tolerance = MERGE_PARAMS.get('correspondence_tolerance', 0.05)
     max_volume_for_merge = MERGE_PARAMS.get('max_volume_for_merge', 4.0)
+    min_cluster_size = args.min_cluster_size if args.min_cluster_size is not None else MERGE_PARAMS.get('min_cluster_size', 300)
     
     print("=" * 60)
     print("Running Merge Task (Python Pipeline)")
     print("=" * 60)
     
     try:
-        # Step 1: Remap predictions (if subsampled_10cm_folder provided)
+        # Step 1: Remap predictions (if source/target folders provided)
         segmented_remapped_folder = None
         
-        if args.subsampled_10cm_folder:
-            subsampled_10cm_dir = Path(args.subsampled_10cm_folder)
+        if args.source_folder and args.target_folder:
+            source_folder = Path(args.source_folder)
+            target_folder = Path(args.target_folder)
             
-            if not subsampled_10cm_dir.exists():
-                print(f"Error: Input directory does not exist: {subsampled_10cm_dir}")
+            if not source_folder.exists():
+                print(f"Error: Source directory does not exist: {source_folder}")
                 sys.exit(1)
             
-            print(f"Input (10cm): {subsampled_10cm_dir}")
-            print(f"Target resolution: {target_resolution}cm")
+            if not target_folder.exists():
+                print(f"Error: Target directory does not exist: {target_folder}")
+                sys.exit(1)
+            
+            # Determine output folder for remap
+            if args.output_folder:
+                remap_output_folder = Path(args.output_folder)
+            elif args.segmented_remapped_folder:
+                remap_output_folder = Path(args.segmented_remapped_folder)
+            else:
+                # Auto-derive output folder
+                remap_output_folder = source_folder.parent / "segmented_remapped"
+            
+            print(f"Remapping: {source_folder} -> {target_folder}")
+            print(f"Remap output: {remap_output_folder}")
             print()
+            
+            # Get tolerance
+            tolerance = args.tolerance if args.tolerance is not None else REMAP_PARAMS.get('tolerance', 5.0)
             
             # Remap
             segmented_remapped_folder = remap_all_tiles(
-                subsampled_10cm_dir=subsampled_10cm_dir,
-                target_resolution_cm=target_resolution,
-                subsampled_target_folder=Path(args.subsampled_target_folder) if args.subsampled_target_folder else None,
-                output_folder=Path(args.output_folder) if args.output_folder else None,
-                num_threads=workers
+                source_folder=source_folder,
+                target_folder=target_folder,
+                output_folder=remap_output_folder,
+                tolerance=tolerance
             )
+            print()
         
         # Step 2: Merge tiles
         if args.segmented_remapped_folder:
@@ -204,20 +307,34 @@ def run_merge_task(args, params):
         print()
         
         output_merged = Path(args.output_merged_laz) if args.output_merged_laz else None
-        output_tiles_dir = Path(args.output_tiles_folder) if args.output_tiles_folder else None
-        original_tiles_dir = Path(args.original_tiles_dir) if args.original_tiles_dir else None
+        
+        # Retiling parameters are now required
+        if not args.output_tiles_folder:
+            print("Error: --output_tiles_folder is required for merge task")
+            sys.exit(1)
+        if not args.original_tiles_dir:
+            print("Error: --original_tiles_dir is required for merge task")
+            sys.exit(1)
+        
+        output_tiles_dir = Path(args.output_tiles_folder)
+        original_tiles_dir = Path(args.original_tiles_dir)
+        
+        # Get centroid_parallel_workers from args (default: 2)
+        centroid_parallel_workers = args.centroid_parallel_workers
         
         merged_output = run_merge(
             segmented_dir=segmented_remapped_folder,
-            output_merged=output_merged,
             output_tiles_dir=output_tiles_dir,
             original_tiles_dir=original_tiles_dir,
+            output_merged=output_merged,
             buffer=buffer,
             overlap_threshold=overlap_threshold,
             max_centroid_distance=max_centroid_distance,
             correspondence_tolerance=correspondence_tolerance,
             max_volume_for_merge=max_volume_for_merge,
+            min_cluster_size=min_cluster_size,
             num_threads=workers,
+            centroid_parallel_workers=centroid_parallel_workers,
             enable_matching=not args.disable_matching,
             require_overlap=True,
             enable_volume_merge=True,
@@ -258,15 +375,25 @@ Examples:
   python run.py --task tile --input_dir /path/to/input --output_dir /path/to/output \\
     --config my_params.py --tile_length 200
   
-  # Merge task: remap + merge (provide 10cm folder to run both)
-  python run.py --task merge --subsampled_10cm_folder /path/to/subsampled_10cm
+  # Remap task: remap predictions by matching spatial bounds
+  python run.py --task remap --source_folder /path/to/segmented --target_folder /path/to/2cm --output_folder /path/to/output
   
-  # Merge task with custom parameters
-  python run.py --task merge --subsampled_10cm_folder /path/to/subsampled_10cm \\
-    --buffer 15.0 --overlap_threshold 0.4
+  # Remap task with custom tolerance
+  python run.py --task remap --source_folder /path/to/segmented --target_folder /path/to/2cm --output_folder /path/to/output --tolerance 10.0
+  
+  # Merge task: remap + merge (provide source/target folders to run both)
+  python run.py --task merge --source_folder /path/to/segmented --target_folder /path/to/2cm \\
+    --output_folder /path/to/remapped --output_tiles_folder /path/to/output_tiles \\
+    --original_tiles_dir /path/to/original_tiles
   
   # Merge task: merge only (provide segmented folder)
-  python run.py --task merge --segmented_remapped_folder /path/to/segmented_remapped
+  python run.py --task merge --segmented_remapped_folder /path/to/segmented_remapped \\
+    --output_tiles_folder /path/to/output_tiles --original_tiles_dir /path/to/original_tiles
+  
+  # Merge task with custom parameters
+  python run.py --task merge --segmented_remapped_folder /path/to/segmented_remapped \\
+    --output_tiles_folder /path/to/output_tiles --original_tiles_dir /path/to/original_tiles \\
+    --buffer 15.0 --overlap_threshold 0.4
   
   # View current parameters
   python run.py --show-params
@@ -289,8 +416,8 @@ Examples:
     parser.add_argument(
         "--task",
         type=str,
-        choices=["tile", "merge"],
-        help="Task to run: tile (tiling+subsampling) or merge (remap+merge)"
+        choices=["tile", "remap", "merge"],
+        help="Task to run: tile (tiling+subsampling), remap (remap by bounds), or merge (merge tiles)"
     )
     
     # Tile task arguments
@@ -303,22 +430,31 @@ Examples:
     parser.add_argument("--grid_offset", type=float, help="Grid offset in meters (default: 1.0)")
     parser.add_argument("--threads", type=int, help="Threads per COPC writer (default: 5)")
     parser.add_argument("--workers", type=int, help="Number of parallel workers (default: 4)")
-    parser.add_argument("--num_spatial_chunks", type=int, help="Number of spatial chunks per tile for subsampling (default: equals workers)")
+    # Note: num_threads for subsampling is controlled by --threads parameter
     parser.add_argument("--resolution_1", type=float, help="First subsampling resolution in meters (default: 0.02 = 2cm)")
     parser.add_argument("--resolution_2", type=float, help="Second subsampling resolution in meters (default: 0.1 = 10cm)")
-    parser.add_argument("--skip_dimension_reduction", action="store_true", help="Skip XYZ-only reduction and keep all point dimensions")
+    parser.add_argument(
+        "--dimension_reduction",
+        type=lambda x: x.lower() in ('true', '1', 'yes', 'on'),
+        default=None,
+        help="Control dimension reduction: 'true' or 'false'. If 'false', keeps all dimensions (PredInstance, etc.). Default: uses parameter file setting (typically 'true' for XYZ-only reduction)"
+    )
     
-    # Remap task arguments (used in merge task)
-    parser.add_argument("--subsampled_10cm_folder", type=str, help="Path to subsampled_10cm folder with segmented results")
-    parser.add_argument("--target_resolution", type=int, help="Target resolution in cm (default: 2)")
-    parser.add_argument("--subsampled_target_folder", type=str, help="Path to target resolution subsampled folder (auto-derived if not specified)")
-    parser.add_argument("--output_folder", type=str, help="Output folder for remapped files (auto-derived if not specified)")
+    # Remap task arguments
+    parser.add_argument("--source_folder", type=str, help="Source folder with LAZ files (e.g., segmented files) - required for remap task")
+    parser.add_argument("--target_folder", type=str, help="Target folder with LAZ files (e.g., 2cm subsampled files) - required for remap task")
+    parser.add_argument("--tolerance", type=float, help="Bounds matching tolerance in meters (default: 5.0)")
+    
+    # Legacy remap arguments (for backwards compatibility)
+    parser.add_argument("--subsampled_10cm_folder", type=str, help="[DEPRECATED] Path to subsampled_10cm folder with segmented results")
+    parser.add_argument("--subsampled_target_folder", type=str, help="[DEPRECATED] Path to target resolution subsampled folder")
+    parser.add_argument("--output_folder", type=str, help="Output folder for remapped files (used by remap task or merge task remap step)")
     
     # Merge task arguments
     parser.add_argument("--segmented_remapped_folder", type=str, help="Path to segmented_remapped folder")
     parser.add_argument("--output_merged_laz", type=str, help="Output path for merged LAZ file (optional)")
-    parser.add_argument("--output_tiles_folder", type=str, help="Output folder for per-tile results (optional)")
-    parser.add_argument("--original_tiles_dir", type=str, help="Directory with original tile files for retiling (optional)")
+    parser.add_argument("--output_tiles_folder", type=str, required=True, help="Output folder for per-tile results (required)")
+    parser.add_argument("--original_tiles_dir", type=str, required=True, help="Directory with original tile files for retiling (required)")
     
     # Merge parameters
     parser.add_argument("--buffer", type=float, help="Buffer distance for filtering in meters (default: 10.0)")
@@ -326,6 +462,8 @@ Examples:
     parser.add_argument("--max_centroid_distance", type=float, help="Max centroid distance to merge instances (default: 3.0)")
     parser.add_argument("--correspondence_tolerance", type=float, help="Point correspondence tolerance in meters (default: 0.05)")
     parser.add_argument("--max_volume_for_merge", type=float, help="Max volume for small instance merge in m³ (default: 4.0)")
+    parser.add_argument("--min_cluster_size", type=int, help="Minimum cluster size in points for reassignment (default: 300)")
+    parser.add_argument("--centroid_parallel_workers", type=int, default=2, help="Number of parallel workers for within-tile centroid computation (default: 2)")
     parser.add_argument("--disable_matching", action="store_true", help="Disable cross-tile instance matching")
     
     args = parser.parse_args()
@@ -348,12 +486,12 @@ Examples:
         param_overrides.append(f"resolution_1={args.resolution_1}")
     if args.resolution_2 is not None:
         param_overrides.append(f"resolution_2={args.resolution_2}")
-    if args.skip_dimension_reduction:
-        param_overrides.append(f"skip_dimension_reduction=True")
+    if hasattr(args, 'dimension_reduction') and args.dimension_reduction is not None:
+        param_overrides.append(f"dimension_reduction={args.dimension_reduction}")
     
     # Remap parameters
-    if args.target_resolution is not None:
-        param_overrides.append(f"target_resolution_cm={args.target_resolution}")
+    if args.tolerance is not None:
+        param_overrides.append(f"tolerance={args.tolerance}")
     
     # Merge parameters
     if args.buffer is not None:
@@ -397,6 +535,8 @@ Examples:
     # Route to appropriate task function
     if args.task == "tile":
         run_tile_task(args, TILE_PARAMS)
+    elif args.task == "remap":
+        run_remap_task(args, REMAP_PARAMS)
     elif args.task == "merge":
         run_merge_task(args, MERGE_PARAMS)
     else:
