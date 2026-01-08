@@ -56,6 +56,7 @@ def run_merge(
     max_volume_for_merge: float = 4.0,
     min_cluster_size: int = 300,
     num_threads: int = 4,
+    centroid_parallel_workers: int = 2,
     enable_matching: bool = True,
     require_overlap: bool = True,
     enable_volume_merge: bool = True,
@@ -135,6 +136,7 @@ def run_merge(
         max_volume_for_merge=max_volume_for_merge,
         min_cluster_size=min_cluster_size,
         num_threads=num_threads,
+        centroid_parallel_workers=centroid_parallel_workers,
         enable_matching=enable_matching,
         require_overlap=require_overlap,
         enable_volume_merge=enable_volume_merge,
@@ -229,6 +231,13 @@ def main():
     )
     
     parser.add_argument(
+        "--centroid_parallel_workers",
+        type=int,
+        default=2,
+        help="Number of parallel workers for within-tile centroid computation (default: 2)"
+    )
+    
+    parser.add_argument(
         "--disable_matching",
         action="store_true",
         help="Disable cross-tile instance matching"
@@ -268,6 +277,7 @@ def main():
         max_volume_for_merge=args.max_volume_for_merge,
         min_cluster_size=args.min_cluster_size,
         num_threads=args.workers,
+        centroid_parallel_workers=args.centroid_parallel_workers,
             enable_matching=not args.disable_matching,
             require_overlap=not args.disable_overlap_check,
             enable_volume_merge=not args.disable_volume_merge,

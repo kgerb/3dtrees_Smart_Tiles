@@ -31,7 +31,8 @@ from pathlib import Path
 from typing import Dict, List, Tuple, Set, Optional, TextIO
 from scipy.spatial import cKDTree, KDTree
 from collections import defaultdict
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+import multiprocessing as mp
 from dataclasses import dataclass
 
 
@@ -210,6 +211,7 @@ def filter_by_centroid_in_buffer(
     tile_name: str,
     all_tiles: Dict[str, Tuple[float, float, float, float]],
     buffer: float = 10.0,
+    centroid_parallel_workers: int = 2,
 ) -> Tuple[Set[int], Dict[int, str]]:
     """
     Find instances whose centroid is in the buffer zone on inner edges.
@@ -250,7 +252,7 @@ def filter_by_centroid_in_buffer(
     # Vectorized centroid computation: O(n log n) instead of O(n * k)
     # Where n = number of points, k = number of instances
     # This provides ~100-250x speedup for typical tiles with many instances
-    centroids = compute_centroids_vectorized(points, instances)
+    centroids = compute_centroids_vectorized(points, instances, default_workers=centroid_parallel_workers)
 
     # Find instances to remove and track their buffer direction
     instances_to_remove = set()
@@ -289,6 +291,7 @@ def load_tile(
     all_tiles: Dict[str, Tuple[float, float, float, float]],
     buffer: float,
     chunk_size: int = 1_000_000,
+    centroid_parallel_workers: int = 2,
 ) -> Optional[Tuple[TileData, Set[int], Set[int], Dict[int, str]]]:
     """
     Load a LAZ tile using chunked reading for memory efficiency.
@@ -368,7 +371,7 @@ def load_tile(
 
     # Filter instances with centroid in buffer zone
     instances_to_remove, instance_buffer_direction = filter_by_centroid_in_buffer(
-        points, instances, boundary, tile_name, all_tiles, buffer
+        points, instances, boundary, tile_name, all_tiles, buffer, centroid_parallel_workers
     )
 
     # Keep track of which instances survived filtering
@@ -403,13 +406,13 @@ def _load_tile_wrapper(args):
     Wrapper function for load_tile to make it pickleable for ProcessPoolExecutor.
     
     Args:
-        args: Tuple of (filepath, tile_boundaries, buffer)
+        args: Tuple of (filepath, tile_boundaries, buffer, centroid_parallel_workers)
     
     Returns:
         Result from load_tile()
     """
-    filepath, tile_boundaries, buffer = args
-    return load_tile(filepath, tile_boundaries, buffer)
+    filepath, tile_boundaries, buffer, centroid_parallel_workers = args
+    return load_tile(filepath, tile_boundaries, buffer, centroid_parallel_workers=centroid_parallel_workers)
 
 
 # =============================================================================
@@ -622,11 +625,54 @@ def compute_ff3d_overlap_ratios(
     return overlap_ratios, size_a, size_b
 
 
+def _chunk_cumsum_and_unique(args):
+    """Helper function for parallel processing of cumsum and unique operations."""
+    chunk_points, chunk_instances = args
+    
+    # Sort this chunk by instance ID
+    sort_idx = np.argsort(chunk_instances)
+    sorted_instances = chunk_instances[sort_idx]
+    sorted_points = chunk_points[sort_idx]
+    
+    # Compute partial cumulative sum
+    cumsum_chunk = np.cumsum(sorted_points, axis=0)
+    
+    # Find unique instances and their boundaries in this chunk
+    unique_instances, first_indices, counts = np.unique(
+        sorted_instances, return_index=True, return_counts=True
+    )
+    
+    # Compute partial centroids for this chunk
+    chunk_centroids = {}
+    for inst_id, start_idx, count in zip(unique_instances, first_indices, counts):
+        end_idx = start_idx + count
+        if count > 0:
+            # For partial sum, use the last value in cumsum_chunk for this instance
+            if end_idx > 0:
+                partial_sum = cumsum_chunk[end_idx - 1] - (cumsum_chunk[start_idx - 1] if start_idx > 0 else 0)
+            else:
+                partial_sum = cumsum_chunk[0] if len(cumsum_chunk) > 0 else np.zeros(3)
+            chunk_centroids[int(inst_id)] = {
+                'partial_sum': partial_sum,
+                'count': count,
+                'last_cumsum': cumsum_chunk[end_idx - 1] if end_idx > 0 else np.zeros(3)
+            }
+    
+    return {
+        'centroids': chunk_centroids,
+        'last_cumsum': cumsum_chunk[-1] if len(cumsum_chunk) > 0 else np.zeros(3),
+        'sorted_instances': sorted_instances,
+        'sorted_points': sorted_points
+    }
+
+
 def compute_centroids_vectorized(
-    points: np.ndarray, instances: np.ndarray
+    points: np.ndarray, instances: np.ndarray, parallel: bool = True, num_workers: Optional[int] = None, default_workers: int = 2
 ) -> Dict[int, np.ndarray]:
     """
     Compute centroids for all instances using vectorized operations.
+    
+    Can use parallel processing for very large arrays (>1M points).
 
     Instead of looping over each instance and scanning the full array,
     this uses sorting and cumulative sums for O(n log n) instead of O(n * k).
@@ -634,6 +680,8 @@ def compute_centroids_vectorized(
     Args:
         points: Nx3 array of point coordinates
         instances: Array of instance IDs
+        parallel: Whether to use parallel processing for large arrays (default: True)
+        num_workers: Number of parallel workers (default: auto-detect)
 
     Returns:
         Dictionary mapping instance_id -> centroid (3D array)
@@ -645,22 +693,120 @@ def compute_centroids_vectorized(
 
     if len(valid_instances) == 0:
         return {}
+    
+    # Use parallel processing for very large arrays (>1M points)
+    # Smaller arrays: parallel overhead not worth it
+    array_size = len(valid_instances)
+    use_parallel = parallel and array_size > 1_000_000
+    
+    if not use_parallel:
+        # Print array size for monitoring
+        if array_size > 100_000:  # Only print for reasonably large arrays to avoid spam
+            print(f"    Computing centroids (sequential): {array_size:,} points")
+        # Original sequential version (fast for smaller arrays)
+        sort_idx = np.argsort(valid_instances)
+        sorted_instances = valid_instances[sort_idx]
+        sorted_points = valid_points[sort_idx]
 
-    # Sort by instance ID
-    sort_idx = np.argsort(valid_instances)
-    sorted_instances = valid_instances[sort_idx]
-    sorted_points = valid_points[sort_idx]
+        unique_instances, first_indices, counts = np.unique(
+            sorted_instances, return_index=True, return_counts=True
+        )
 
-    # Find boundaries between different instances
+        cumsum = np.zeros((len(sorted_points) + 1, 3), dtype=np.float64)
+        cumsum[1:] = np.cumsum(sorted_points, axis=0)
+
+        centroids = {}
+        for i, (inst_id, start_idx, count) in enumerate(
+            zip(unique_instances, first_indices, counts)
+        ):
+            end_idx = start_idx + count
+            centroid = (cumsum[end_idx] - cumsum[start_idx]) / count
+            centroids[int(inst_id)] = centroid
+
+        return centroids
+    
+    # Parallel version for large arrays
+    print(f"    Computing centroids (parallel): {array_size:,} points")
+    if num_workers is None:
+        # Use default_workers for within-tile parallelization (default: 4)
+        # This can be controlled via centroid_parallel_workers parameter
+        num_workers = default_workers
+    print(f"      Using {num_workers} workers for parallel processing")
+    
+    # Split into chunks (try to keep instances together in same chunk when possible)
+    # Simple approach: split by point count
+    chunk_size = len(valid_points) // num_workers
+    chunks = []
+    
+    for i in range(num_workers):
+        start = i * chunk_size
+        end = len(valid_points) if i == num_workers - 1 else (i + 1) * chunk_size
+        if end > start:  # Only add non-empty chunks
+            chunks.append((valid_points[start:end].copy(), valid_instances[start:end].copy()))
+    
+    if len(chunks) == 0:
+        # Fallback to sequential if no chunks
+        return {}
+    
+    # Process chunks in parallel using ProcessPoolExecutor for true CPU parallelism
+    # Note: If already in a ProcessPoolExecutor (from tile loading), this creates nested processes
+    # which should still work but may have overhead
+    print(f"      Processing {len(chunks)} chunks in parallel...")
+    try:
+        with ProcessPoolExecutor(max_workers=len(chunks)) as executor:
+            chunk_results = list(executor.map(_chunk_cumsum_and_unique, chunks))
+        print(f"      Parallel processing complete: {len(chunk_results)} chunks processed")
+    except Exception as e:
+        print(f"      Warning: Parallel processing failed: {e}, falling back to sequential")
+        import traceback
+        traceback.print_exc()
+        # Fallback to sequential
+        sort_idx = np.argsort(valid_instances)
+        sorted_instances = valid_instances[sort_idx]
+        sorted_points = valid_points[sort_idx]
+        unique_instances, first_indices, counts = np.unique(
+            sorted_instances, return_index=True, return_counts=True
+        )
+        cumsum = np.zeros((len(sorted_points) + 1, 3), dtype=np.float64)
+        cumsum[1:] = np.cumsum(sorted_points, axis=0)
+        centroids = {}
+        for i, (inst_id, start_idx, count) in enumerate(
+            zip(unique_instances, first_indices, counts)
+        ):
+            end_idx = start_idx + count
+            centroid = (cumsum[end_idx] - cumsum[start_idx]) / count
+            centroids[int(inst_id)] = centroid
+        return centroids
+    
+    # Merge results across chunks
+    # Strategy: concatenate sorted arrays, then recompute unique and cumsum on merged data
+    # This is simpler and more correct than trying to merge partial cumsums
+    all_sorted_instances = []
+    all_sorted_points = []
+    
+    for chunk_result in chunk_results:
+        all_sorted_instances.append(chunk_result['sorted_instances'])
+        all_sorted_points.append(chunk_result['sorted_points'])
+    
+    # Concatenate all sorted arrays
+    all_instances = np.concatenate(all_sorted_instances)
+    all_points = np.concatenate(all_sorted_points)
+    
+    # Re-sort to ensure proper ordering (chunks might have been split at instance boundaries)
+    final_sort_idx = np.argsort(all_instances)
+    all_instances = all_instances[final_sort_idx]
+    all_points = all_points[final_sort_idx]
+    
+    # Final unique and cumsum on merged data
     unique_instances, first_indices, counts = np.unique(
-        sorted_instances, return_index=True, return_counts=True
+        all_instances, return_index=True, return_counts=True
     )
-
-    # Compute cumulative sums for efficient mean calculation
-    cumsum = np.zeros((len(sorted_points) + 1, 3), dtype=np.float64)
-    cumsum[1:] = np.cumsum(sorted_points, axis=0)
-
-    # Calculate centroids using cumulative sum differences
+    
+    # Compute final cumulative sum
+    cumsum = np.zeros((len(all_points) + 1, 3), dtype=np.float64)
+    cumsum[1:] = np.cumsum(all_points, axis=0)
+    
+    # Calculate final centroids
     centroids = {}
     for i, (inst_id, start_idx, count) in enumerate(
         zip(unique_instances, first_indices, counts)
@@ -668,7 +814,7 @@ def compute_centroids_vectorized(
         end_idx = start_idx + count
         centroid = (cumsum[end_idx] - cumsum[start_idx]) / count
         centroids[int(inst_id)] = centroid
-
+    
     return centroids
 
 
@@ -735,7 +881,8 @@ def reassign_small_clusters(
     print(f"  Found {len(small_instances)} small clusters (<{min_cluster_size} points)")
 
     # Compute ALL centroids in one vectorized pass
-    all_centroids = compute_centroids_vectorized(points, instances)
+    # Use default 2 workers for small cluster reassignment (typically smaller arrays)
+    all_centroids = compute_centroids_vectorized(points, instances, default_workers=2)
 
     # Extract large instance centroids
     large_ids = list(large_instances)
@@ -1313,6 +1460,7 @@ def merge_tiles(
     max_volume_for_merge: float = 4.0,
     min_cluster_size: int = 300,
     num_threads: int = 8,
+    centroid_parallel_workers: int = 2,
     enable_matching: bool = True,
     require_overlap: bool = True,
     enable_volume_merge: bool = True,
@@ -1419,7 +1567,8 @@ def merge_tiles(
 
     # Load tiles in parallel using ProcessPoolExecutor for true CPU parallelism
     # Prepare arguments for multiprocessing (must be pickleable)
-    load_args = [(f, tile_boundaries, buffer) for f in laz_files]
+    # centroid_parallel_workers controls within-tile parallel processing (default: 4)
+    load_args = [(f, tile_boundaries, buffer, centroid_parallel_workers) for f in laz_files]
 
     with ProcessPoolExecutor(max_workers=num_threads) as executor:
         results = list(executor.map(_load_tile_wrapper, load_args))
@@ -1743,8 +1892,9 @@ def merge_tiles(
                 )
 
                 # Pre-compute centroids using vectorized function
-                centroids_a = compute_centroids_vectorized(points_a, inst_a)
-                centroids_b = compute_centroids_vectorized(points_b, inst_b)
+                # Use default 2 workers for overlap region centroids (typically smaller arrays)
+                centroids_a = compute_centroids_vectorized(points_a, inst_a, default_workers=2)
+                centroids_b = compute_centroids_vectorized(points_b, inst_b, default_workers=2)
 
                 # Find matching pairs above threshold AND within centroid distance
                 matches_in_pair = 0
