@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Main tiling script: XYZ reduction, COPC conversion, index building, and tiling.
+Main tiling script: COPC conversion, index building, and tiling.
 
 This script handles the first phase of the 3DTrees pipeline:
-1. Convert input LAZ files to XYZ-only COPC (reduced file size)
+1. Convert input LAZ files to COPC (with optional XYZ-only reduction using untwine --dims)
 2. Build spatial index (tindex)
 3. Calculate tile bounds
 4. Create overlapping tiles
@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -54,170 +55,92 @@ def get_pdal_wrench_path() -> str:
     return wrench_path if wrench_path else "pdal_wrench"
 
 
-def create_minimal_laz(input_file: Path, output_file: Path, chunk_size: int = 1_000_000) -> bool:
-    """
-    Create a minimal LAZ file with only XYZ coordinates using laspy chunked reading.
-    
-    This creates the smallest possible LAZ file by:
-    1. Using point format 0 (minimal format)
-    2. Keeping only X, Y, Z data
-    3. Zeroing out all other mandatory fields
-    4. Processing in chunks for memory efficiency with large files
-    
-    Args:
-        input_file: Path to input LAZ file
-        output_file: Path to output minimal LAZ file
-        chunk_size: Number of points to process per chunk (default: 1M points)
-    
-    Returns:
-        True if successful, False otherwise
-    """
-    import laspy
-    
-    try:
-        with laspy.open(str(input_file)) as reader:
-            # Create output header with point format 0 (minimal: 20 bytes/point)
-            out_header = laspy.LasHeader(point_format=0, version="1.2")
-            out_header.offsets = reader.header.offsets
-            out_header.scales = reader.header.scales
-            
-            # Determine best available LAZ backend
-            laz_backend = None
-            for backend in [laspy.LazBackend.LazrsParallel, laspy.LazBackend.Lazrs, laspy.LazBackend.Laszip]:
-                try:
-                    laz_backend = backend
-                    break
-                except Exception:
-                    continue
-            
-            # Open writer with compression (auto-detect backend if needed)
-            writer_kwargs = {'mode': 'w', 'header': out_header}
-            if laz_backend:
-                writer_kwargs['laz_backend'] = laz_backend
-            
-            with laspy.open(str(output_file), **writer_kwargs) as writer:
-                # Process in chunks for memory efficiency
-                for chunk in reader.chunk_iterator(chunk_size):
-                    # Create minimal point record with only XYZ
-                    out_points = laspy.ScaleAwarePointRecord.zeros(len(chunk), header=out_header)
-                    out_points.x = chunk.x
-                    out_points.y = chunk.y
-                    out_points.z = chunk.z
-                    
-                    writer.write_points(out_points)
-        
-        return True
-    except Exception as e:
-        print(f"    Error creating minimal LAZ: {e}")
-        return False
+def get_untwine_path() -> str:
+    """Get the path to untwine executable."""
+    import shutil
+    # Use shutil.which to find untwine in PATH
+    untwine_path = shutil.which("untwine")
+    return untwine_path if untwine_path else "untwine"
 
 
-def convert_single_file(args: Tuple[Path, Path, Path, bool]) -> Tuple[str, bool, str]:
+def convert_single_file(args: Tuple[Path, Path, Path, bool, Optional[str]]) -> Tuple[str, bool, str]:
     """
-    Convert a single LAZ file to COPC.
+    Convert a single LAZ file to COPC using untwine.
     
     Two modes:
-    1. With dimension reduction (default): 
-       - Use laspy to create minimal LAZ (XYZ only, format 0)
-       - Convert to COPC using pdal_wrench
+    1. With dimension reduction (dimension_reduction=True, default): 
+       - Convert to COPC using untwine with --dims X,Y,Z
        - Achieves ~37% size reduction
-    2. Without dimension reduction (skip_dimension_reduction=True):
-       - Direct conversion to COPC preserving all dimensions
+    2. Without dimension reduction (dimension_reduction=False):
+       - Direct conversion to COPC using untwine preserving all dimensions
     
     Args:
-        args: Tuple of (input_file, output_file, log_dir, skip_dimension_reduction)
+        args: Tuple of (input_file, output_file, log_dir, dimension_reduction, original_filename)
     
     Returns:
         Tuple of (filename, success, message)
     """
-    input_file, output_file, log_dir, skip_dimension_reduction = args
+    input_file, output_file, log_dir, dimension_reduction, original_filename = args
+    # Use original filename for reporting if provided, otherwise use input_file.name
+    display_name = original_filename if original_filename else input_file.name
     
     try:
         log_file = log_dir / f"{input_file.stem}_convert.log"
         
-        if skip_dimension_reduction:
-            # Use PDAL pipeline to preserve ALL dimensions including extra dimensions
-            import json
-            
-            pipeline_file = log_dir / f"{input_file.stem}_copc_pipeline.json"
-            pipeline = {
-                "pipeline": [
-                    {
-                        "type": "readers.las",
-                        "filename": str(input_file)
-                    },
-                    {
-                        "type": "writers.copc",
-                        "filename": str(output_file),
-                        "forward": "all",  # Forward all dimensions including extra
-                        "extra_dims": "all"  # Explicitly preserve extra dimensions
-                    }
-                ]
-            }
-            
-            with open(pipeline_file, 'w') as f:
-                json.dump(pipeline, f, indent=2)
-            
-            pdal_cmd = get_pdal_path()
-            result = subprocess.run(
-                [pdal_cmd, "pipeline", str(pipeline_file)],
-                capture_output=True,
-                text=True,
-                check=False
-            )
-            
-            # Clean up pipeline file on success
-            if result.returncode == 0 and pipeline_file.exists():
-                pipeline_file.unlink()
-            
-            # Save log on error
-            if result.returncode != 0:
-                with open(log_file, 'w') as f:
-                    f.write(f"Command: pdal pipeline {pipeline_file}\n")
-                    f.write(f"Return code: {result.returncode}\n")
-                    f.write(f"Stderr:\n{result.stderr}\n")
-        else:
-            # Two-step process with dimension reduction
-            # Step 1: Create minimal LAZ with laspy (XYZ only)
-            temp_laz = log_dir / f"{input_file.stem}_minimal.laz"
-            
-            if not create_minimal_laz(input_file, temp_laz):
-                return (input_file.name, False, "Failed to create minimal LAZ")
-            
-            # Step 2: Convert minimal LAZ to COPC using pdal_wrench (fast)
-            result = subprocess.run(
-                [
-                    pdal_wrench, "translate",
-                    f"--input={temp_laz}",
-                    f"--output={output_file}"
-                ],
-                capture_output=True,
-                text=True,
-                check=False
-            )
-            
-            # Save log on error
-            if result.returncode != 0:
-                with open(log_file, 'w') as f:
-                    f.write(f"Command: pdal_wrench translate --input={temp_laz} --output={output_file}\n")
-                    f.write(f"Return code: {result.returncode}\n")
-                    f.write(f"Stderr:\n{result.stderr}\n")
-            
-            # Clean up temp LAZ
-            if temp_laz.exists():
-                temp_laz.unlink()
+        # Use untwine for COPC conversion
+        untwine_cmd = get_untwine_path()
+        
+        # Create temp directory for untwine intermediate files
+        temp_untwine_dir = log_dir / f"{input_file.stem}_untwine_temp"
+        temp_untwine_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Build untwine command
+        # For dimension reduction: use --dims X,Y,Z to limit to XYZ only
+        # For no dimension reduction: keep all dimensions (no --dims flag)
+        untwine_args = [
+            untwine_cmd,
+            "-i", str(input_file),
+            "-o", str(output_file),
+            "--temp_dir", str(temp_untwine_dir)
+        ]
+        
+        # Add --dims flag for dimension reduction
+        if dimension_reduction:
+            untwine_args.extend(["--dims", "X,Y,Z"])
+        
+        result = subprocess.run(
+            untwine_args,
+            capture_output=True,
+            text=True,
+            check=False
+        )
+        
+        # Clean up temp directory on success
+        if result.returncode == 0 and temp_untwine_dir.exists():
+            try:
+                shutil.rmtree(temp_untwine_dir)
+            except Exception:
+                pass  # Ignore cleanup errors
+        
+        # Save log on error
+        if result.returncode != 0:
+            with open(log_file, 'w') as f:
+                f.write(f"Command: {' '.join(untwine_args)}\n")
+                f.write(f"Return code: {result.returncode}\n")
+                f.write(f"Stdout:\n{result.stdout}\n")
+                f.write(f"Stderr:\n{result.stderr}\n")
         
         if result.returncode != 0:
-            return (input_file.name, False, result.stderr[:200])
+            return (display_name, False, result.stderr[:200])
         
         # Verify output exists and has content
         if not output_file.exists() or output_file.stat().st_size == 0:
-            return (input_file.name, False, "Output file empty or not created")
+            return (display_name, False, "Output file empty or not created")
         
-        return (input_file.name, True, "Success")
+        return (display_name, True, "Success")
         
     except Exception as e:
-        return (input_file.name, False, str(e))
+        return (display_name, False, str(e))
 
 
 def convert_to_xyz_copc(
@@ -225,12 +148,13 @@ def convert_to_xyz_copc(
     output_dir: Path,
     num_workers: int,
     log_dir: Optional[Path] = None,
-    skip_dimension_reduction: bool = False
+    dimension_reduction: bool = True
 ) -> List[Path]:
     """
-    Convert LAZ files to COPC format using pdal_wrench.
+    Convert LAZ files to COPC format using untwine.
     
-    Uses pdal_wrench translate for efficient COPC conversion with spatial indexing.
+    Uses untwine for efficient COPC conversion with spatial indexing.
+    If dimension_reduction=True, uses --dims X,Y,Z to limit to XYZ only.
     Parallelizes across num_workers.
     
     Args:
@@ -238,16 +162,16 @@ def convert_to_xyz_copc(
         output_dir: Directory for output COPC files
         num_workers: Number of parallel workers
         log_dir: Directory for log files (optional)
-        skip_dimension_reduction: Skip XYZ-only reduction and keep all dimensions
+        dimension_reduction: Enable XYZ-only reduction using untwine --dims (default: True)
     
     Returns:
         List of created COPC file paths
     """
     print("=" * 60)
-    if skip_dimension_reduction:
-        print("Step 1: Converting LAZ to COPC (preserving all dimensions)")
+    if dimension_reduction:
+        print("Step 1: Converting LAZ to COPC (XYZ-only using untwine --dims)")
     else:
-        print("Step 1: Converting LAZ to COPC (XYZ-only)")
+        print("Step 1: Converting LAZ to COPC (preserving all dimensions)")
     print("=" * 60)
     
     # Create output directory
@@ -287,7 +211,8 @@ def convert_to_xyz_copc(
             print(f"  Skipping {input_file.name} (already converted)")
             continue
         
-        tasks.append((input_file, output_file, log_dir, skip_dimension_reduction))
+        # Use original file directly - untwine will handle dimension reduction with --dims
+        tasks.append((input_file, output_file, log_dir, dimension_reduction, input_file.name))
     
     if not tasks:
         print("  All files already converted")
@@ -525,7 +450,6 @@ def process_single_tile(args: Tuple[str, str, str, List[str], Path, Path, int]) 
                     {
                         "type": "writers.copc",
                         "filename": str(part_file),
-                        "threads": threads,
                         "forward": "all",
                         "extra_dims": "all"  # Preserve extra dimensions like PredInstance
                     }
@@ -573,7 +497,6 @@ def process_single_tile(args: Tuple[str, str, str, List[str], Path, Path, int]) 
                     {
                         "type": "writers.copc",
                         "filename": str(final_tile),
-                        "threads": threads,
                         "forward": "all",
                         "extra_dims": "all",  # Preserve extra dimensions like PredInstance
                         "scale_x": 0.01,
@@ -710,13 +633,13 @@ def run_tiling_pipeline(
     num_workers: int = 4,
     threads: int = 5,
     max_tile_procs: int = 5,
-    skip_dimension_reduction: bool = False
+    dimension_reduction: bool = True
 ) -> Path:
     """
     Run the complete tiling pipeline.
     
     Steps:
-    1. Convert LAZ to COPC (with or without dimension reduction)
+    1. Convert LAZ to COPC (with or without dimension reduction using untwine --dims)
     2. Build spatial index
     3. Calculate tile bounds
     4. Create overlapping tiles
@@ -730,7 +653,7 @@ def run_tiling_pipeline(
         num_workers: Number of parallel conversion workers
         threads: Threads per COPC writer
         max_tile_procs: Maximum parallel tile processes
-        skip_dimension_reduction: Skip XYZ-only reduction and keep all dimensions
+        dimension_reduction: Enable XYZ-only reduction using untwine --dims (default: True)
     
     Returns:
         Path to tiles directory
@@ -744,13 +667,13 @@ def run_tiling_pipeline(
     print()
     
     # Define paths
-    copc_dir = output_dir / ("copc_full" if skip_dimension_reduction else "copc_xyz")
+    copc_dir = output_dir / ("copc_full" if not dimension_reduction else "copc_xyz")
     tiles_dir = output_dir / f"tiles_{int(tile_length)}m"
     log_dir = output_dir / "logs"
     tindex_file = output_dir / f"tindex_{int(tile_length)}m.gpkg"
     
-    # Step 1: Convert to COPC
-    copc_files = convert_to_xyz_copc(input_dir, copc_dir, num_workers, log_dir, skip_dimension_reduction)
+    # Step 1: Convert to COPC (untwine handles dimension reduction with --dims if enabled)
+    copc_files = convert_to_xyz_copc(input_dir, copc_dir, num_workers, log_dir, dimension_reduction)
     
     if not copc_files:
         raise ValueError("No COPC files created or found")

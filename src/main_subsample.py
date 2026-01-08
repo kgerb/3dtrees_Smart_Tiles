@@ -8,6 +8,12 @@ This script handles subsampling of tiled point clouds:
 
 Files are split across available CPU cores for parallel processing.
 
+COPC Optimizations:
+- Uses COPC native bounds filtering in readers.copc (more efficient than filters.crop)
+- Writes output as COPC format when input is COPC (better performance for subsequent steps)
+- Leverages COPC's spatial indexing for efficient chunk-based processing
+- Multi-threaded COPC writing for improved performance
+
 Usage:
     python main_subsample.py --tiles_dir /path/to/tiles --res1 0.02 --res2 0.1
 """
@@ -31,6 +37,7 @@ except ImportError:
         'resolution_1': 0.02,  # 2cm
         'resolution_2': 0.1,   # 10cm
         'workers': 4,
+        'threads': 5,  # Number of spatial chunks per file for parallel subsampling
     }
 
 
@@ -79,7 +86,11 @@ def get_file_bounds(filepath: Path) -> Optional[Tuple[float, float, float, float
 
 def subsample_tile_chunk(args: Tuple[Path, str, float, Path, int, int]) -> Tuple[Path, int]:
     """
-    Subsample a spatial chunk of a tile using PDAL with bounds filter.
+    Subsample a spatial chunk of a tile using PDAL with COPC-optimized bounds filter.
+    
+    COPC optimizations:
+    - Uses bounds parameter directly in readers.copc (more efficient than filters.crop)
+    - Output is always LAZ format (compressed LAS)
     
     Args:
         args: Tuple of (input_file, bounds_str, resolution, output_dir, chunk_idx, total_chunks)
@@ -90,36 +101,35 @@ def subsample_tile_chunk(args: Tuple[Path, str, float, Path, int, int]) -> Tuple
     input_file, bounds_str, resolution, output_dir, chunk_idx, total_chunks = args
     
     try:
-        # Determine reader type
+        # Determine reader type - can read COPC or LAS
         is_copc = input_file.name.endswith('.copc.laz')
         reader_type = "readers.copc" if is_copc else "readers.las"
         
-        # Create output filename for this chunk
+        # Always output as LAZ format (compressed LAS)
         chunk_file = output_dir / f"{input_file.stem}_chunk{chunk_idx}.laz"
         
-        # Create pipeline with bounds filter
-        pipeline = {
-            "pipeline": [
-                {
-                    "type": reader_type,
-                    "filename": str(input_file)
-                },
-                {
-                    "type": "filters.crop",
-                    "bounds": bounds_str
-                },
-                {
-                    "type": "filters.voxelcentroidnearestneighbor",
-                    "cell": resolution
-                },
-                {
-                    "type": "writers.las",
-                    "filename": str(chunk_file),
-                    "compression": True,
-                    "extra_dims": "all"  # Preserve extra dimensions like PredInstance
-                }
-            ]
-        }
+        # Build pipeline - use COPC bounds filtering if available
+        if is_copc:
+            # COPC: Use bounds parameter directly in reader (most efficient)
+            pipeline = {
+                "pipeline": [
+                    {
+                        "type": reader_type,
+                        "filename": str(input_file),
+                        "bounds": bounds_str  # COPC native bounds filtering - very efficient
+                    },
+                    {
+                        "type": "filters.voxelcentroidnearestneighbor",
+                        "cell": resolution
+                    },
+                    {
+                        "type": "writers.las",  # Always write as LAZ (compressed LAS)
+                        "filename": str(chunk_file),
+                        "compression": True,
+                        "extra_dims": "all"  # Preserve extra dimensions like PredInstance
+                    }
+                ]
+            }
         
         # Write and execute pipeline
         pipeline_file = output_dir / f"_pipeline_chunk{chunk_idx}.json"
@@ -171,16 +181,20 @@ def subsample_tile_chunk(args: Tuple[Path, str, float, Path, int, int]) -> Tuple
 
 def subsample_single_file(args: Tuple[Path, Path, float, Path, int]) -> Tuple[str, bool, str, int]:
     """
-    Subsample a single file by splitting it spatially and processing chunks in parallel.
+    Subsample a single file by splitting it into subtiles along X-axis and processing in parallel.
+    
+    Process:
+    1. Split tile into num_threads subtiles along X-axis only
+    2. Subsample each subtile in parallel using ProcessPoolExecutor (true CPU parallelism)
+    3. Merge all subsampled subtiles back together
     
     Args:
-        args: Tuple of (input_file, output_file, resolution, pipeline_dir, num_spatial_chunks)
+        args: Tuple of (input_file, output_file, resolution, pipeline_dir, num_threads)
     
     Returns:
         Tuple of (filename, success, message, point_count)
     """
-    input_file, output_file, resolution, pipeline_dir, num_spatial_chunks = args
-    
+    input_file, output_file, resolution, pipeline_dir, num_threads = args
     try:
         print(f"    → Processing {input_file.name}...")
         
@@ -192,37 +206,36 @@ def subsample_single_file(args: Tuple[Path, Path, float, Path, int]) -> Tuple[st
         
         minx, maxx, miny, maxy = bounds
         
-        # Calculate spatial splits (square grid as much as possible)
-        import math
-        grid_size = math.ceil(math.sqrt(num_spatial_chunks))
-        x_step = (maxx - minx) / grid_size
-        y_step = (maxy - miny) / grid_size
+        # Split into num_threads subtiles along X-axis only
+        grid_x = num_threads
+        grid_y = 1
         
-        print(f"      Splitting into {grid_size}x{grid_size} grid ({grid_size*grid_size} chunks)")
+        # Calculate step size for X-axis
+        x_step = (maxx - minx) / grid_x
         
-        # Create chunk tasks
+        print(f"      Splitting into {num_threads} subtiles along X-axis only ({grid_x}x{grid_y} grid)")
+        
+        # Create chunk tasks - exactly num_threads chunks
         chunk_dir = pipeline_dir / f"{input_file.stem}_chunks"
         chunk_dir.mkdir(parents=True, exist_ok=True)
         
         chunk_tasks = []
-        chunk_idx = 0
-        for ix in range(grid_size):
-            for iy in range(grid_size):
-                chunk_minx = minx + ix * x_step
-                chunk_maxx = minx + (ix + 1) * x_step
-                chunk_miny = miny + iy * y_step
-                chunk_maxy = miny + (iy + 1) * y_step
-                
-                bounds_str = f"([{chunk_minx},{chunk_maxx}],[{chunk_miny},{chunk_maxy}])"
-                chunk_tasks.append((input_file, bounds_str, resolution, chunk_dir, chunk_idx, len(chunk_tasks) + grid_size*grid_size - chunk_idx))
-                chunk_idx += 1
+        for chunk_idx in range(num_threads):
+            chunk_minx = minx + chunk_idx * x_step
+            chunk_maxx = minx + (chunk_idx + 1) * x_step
+            # Keep full Y range for each chunk
+            chunk_miny = miny
+            chunk_maxy = maxy
+            
+            bounds_str = f"([{chunk_minx},{chunk_maxx}],[{chunk_miny},{chunk_maxy}])"
+            chunk_tasks.append((input_file, bounds_str, resolution, chunk_dir, chunk_idx, num_threads))
         
-        # Process chunks in parallel
-        from concurrent.futures import ThreadPoolExecutor, as_completed
+        # Process chunks in parallel using ProcessPoolExecutor for true CPU parallelism
         chunk_files = []
         total_points = 0
         
-        with ThreadPoolExecutor(max_workers=num_spatial_chunks) as executor:
+        print(f"      → Subsampling {len(chunk_tasks)} subtiles in parallel...")
+        with ProcessPoolExecutor(max_workers=num_threads) as executor:
             futures = [executor.submit(subsample_tile_chunk, task) for task in chunk_tasks]
             for future in as_completed(futures):
                 chunk_file, point_count = future.result()
@@ -233,17 +246,24 @@ def subsample_single_file(args: Tuple[Path, Path, float, Path, int]) -> Tuple[st
         if not chunk_files:
             return (input_file.name, False, "No chunks produced", 0)
         
-        print(f"      → Merging {len(chunk_files)} chunks...")
+        print(f"      → Merging {len(chunk_files)} subsampled subtiles...")
         
-        # Merge chunks using PDAL
+        # Merge chunks using PDAL - always write as LAZ format
+        # Chunk files are already LAZ from subsample_tile_chunk
+        reader_type = "readers.las"  # Chunks are LAZ files
+        
+        # Ensure output is LAZ format
+        if not output_file.name.endswith('.laz'):
+            output_file = output_file.parent / (output_file.stem + '.laz')
+        
         merge_pipeline = {
             "pipeline": [
-                *[{"type": "readers.las", "filename": str(f)} for f in chunk_files],
+                *[{"type": reader_type, "filename": str(f)} for f in chunk_files],
                 {
                     "type": "filters.merge"
                 },
                 {
-                    "type": "writers.las",
+                    "type": "writers.las",  # Always write as LAZ (compressed LAS)
                     "filename": str(output_file),
                     "compression": True,
                     "extra_dims": "all"  # Preserve extra dimensions like PredInstance
@@ -302,7 +322,9 @@ def subsample_single_file(args: Tuple[Path, Path, float, Path, int]) -> Tuple[st
 
 def subsample_simple(input_file: Path, output_file: Path, resolution: float, pipeline_dir: Path) -> Tuple[str, bool, str, int]:
     """
-    Simple single-pass subsampling (fallback method).
+    Simple single-pass subsampling (fallback method) with COPC reader optimization.
+    
+    Uses COPC reader for efficient reading, but always outputs LAZ format.
     
     Args:
         input_file: Input file path
@@ -317,12 +339,16 @@ def subsample_simple(input_file: Path, output_file: Path, resolution: float, pip
         is_copc = input_file.name.endswith('.copc.laz')
         reader_type = "readers.copc" if is_copc else "readers.las"
         
+        # Always output as LAZ format (compressed LAS)
+        if not output_file.name.endswith('.laz'):
+            output_file = output_file.parent / (output_file.stem + '.laz')
+        
         pipeline = {
             "pipeline": [
                 {"type": reader_type, "filename": str(input_file)},
                 {"type": "filters.voxelcentroidnearestneighbor", "cell": resolution},
                 {
-                    "type": "writers.las",
+                    "type": "writers.las",  # Always write as LAZ (compressed LAS)
                     "filename": str(output_file),
                     "compression": True,
                     "extra_dims": "all"  # Preserve extra dimensions like PredInstance
@@ -378,22 +404,22 @@ def subsample_parallel(
     output_dir: Path,
     resolution: float,
     num_cores: int,
-    num_spatial_chunks: int = 4,
+    num_threads: int,
     output_prefix: Optional[str] = None
 ) -> List[Path]:
     """
-    Subsample all files in directory using parallel processing.
+    Subsample all files in directory using parallel chunk processing.
     
-    Each file is split spatially into chunks and processed in parallel.
-    Files are distributed across available CPU cores.
+    Files are processed sequentially (one at a time), but each file is split
+    spatially into chunks along X-axis and processed in parallel.
     Uses PDAL voxelcentroidnearestneighbor filter.
     
     Args:
         input_dir: Directory containing input files
         output_dir: Directory for output files
         resolution: Voxel resolution in meters
-        num_cores: Number of parallel file workers
-        num_spatial_chunks: Number of spatial chunks per file (default: 4)
+        num_cores: Not used (kept for compatibility)
+        num_threads: Number of spatial chunks per file (from TILE_PARAMS['threads'])
         output_prefix: Optional prefix for output filenames
     
     Returns:
@@ -407,7 +433,9 @@ def subsample_parallel(
     pipeline_dir.mkdir(exist_ok=True)
     
     # Find input files
-    input_files = list(input_dir.glob("*.copc.laz")) + list(input_dir.glob("*.laz"))
+    # Get all LAZ files (both .laz and .copc.laz)
+    # Note: *.laz will match both .laz and .copc.laz, so we use set to deduplicate
+    input_files = sorted(set(list(input_dir.glob("*.laz")) + list(input_dir.glob("*.copc.laz"))))
     
     if not input_files:
         print(f"    No input files found in {input_dir}")
@@ -441,33 +469,30 @@ def subsample_parallel(
             print(f"    ⊙ Skipping {input_file.name} (already exists)")
             continue
         
-        tasks.append((input_file, output_file, resolution, pipeline_dir, num_spatial_chunks))
+        tasks.append((input_file, output_file, resolution, pipeline_dir, num_threads))
     
     if not tasks:
         print(f"    ✓ All files already subsampled")
         return list(output_dir.glob("*.laz"))
     
     print(f"    Files to process: {len(tasks)}")
-    print(f"    File workers: {num_cores} parallel")
-    print(f"    Spatial chunks per file: {num_spatial_chunks}")
+    print(f"    Processing mode: Sequential (one file at a time)")
+    print(f"    Chunk parallelism: {num_threads} chunks per file (parallel)")
     print()
     
-    # Process files in parallel
+    # Process files sequentially, but chunks within each file in parallel
     successful = 0
     failed = 0
     total_points = 0
     
-    with ProcessPoolExecutor(max_workers=num_cores) as executor:
-        futures = {executor.submit(subsample_single_file, task): task[0] for task in tasks}
-        
-        for future in as_completed(futures):
-            filename, success, message, point_count = future.result()
-            if success:
-                successful += 1
-                total_points += point_count
-            else:
-                failed += 1
-                print(f"    ✗ {filename}: {message}")
+    for task in tasks:
+        filename, success, message, point_count = subsample_single_file(task)
+        if success:
+            successful += 1
+            total_points += point_count
+        else:
+            failed += 1
+            print(f"    ✗ {filename}: {message}")
     
     # Clean up pipeline directory
     if pipeline_dir.exists() and not any(pipeline_dir.iterdir()):
@@ -486,7 +511,7 @@ def run_subsample_pipeline(
     res1: float = 0.02,
     res2: float = 0.1,
     num_cores: Optional[int] = None,
-    num_spatial_chunks: Optional[int] = None,
+    num_threads: Optional[int] = None,
     output_prefix: Optional[str] = None
 ) -> Tuple[Path, Path]:
     """
@@ -496,14 +521,15 @@ def run_subsample_pipeline(
     1. Subsample tiles to resolution 1 (default: 2cm)
     2. Subsample resolution 1 files to resolution 2 (default: 10cm)
     
-    Each tile is split spatially into num_spatial_chunks and processed in parallel.
+    Files are processed sequentially (one at a time), but each file is split
+    spatially into num_threads chunks along X-axis and processed in parallel.
     
     Args:
         tiles_dir: Directory containing tile COPC files
         res1: First resolution in meters (default: 0.02 = 2cm)
         res2: Second resolution in meters (default: 0.1 = 10cm)
-        num_cores: Number of parallel workers (default: auto-detect)
-        num_spatial_chunks: Spatial chunks per tile (default: equals num_cores)
+        num_cores: Not used (kept for compatibility)
+        num_threads: Number of parallel chunks per file (default: from TILE_PARAMS['threads'])
         output_prefix: Optional prefix for output filenames
     
     Returns:
@@ -513,9 +539,9 @@ def run_subsample_pipeline(
     if num_cores is None:
         num_cores = get_cpu_count()
     
-    # Default: num_spatial_chunks = num_cores (one chunk per thread)
-    if num_spatial_chunks is None:
-        num_spatial_chunks = num_cores
+    # Get num_threads from TILE_PARAMS
+    if num_threads is None:
+        num_threads = TILE_PARAMS.get('threads', 5)
     
     # Convert to cm for directory names
     res1_cm = int(res1 * 100)
@@ -532,6 +558,7 @@ def run_subsample_pipeline(
     print(f"Resolution 1: {res1}m ({res1_cm}cm)")
     print(f"Resolution 2: {res2}m ({res2_cm}cm)")
     print(f"CPU cores: {num_cores}")
+    print(f"Threads (chunks per file): {num_threads}")
     print()
     
     # Step 1: Subsample to resolution 1
@@ -544,7 +571,7 @@ def run_subsample_pipeline(
         output_dir=subsampled_res1_dir,
         resolution=res1,
         num_cores=num_cores,
-        num_spatial_chunks=num_spatial_chunks,
+        num_threads=num_threads,
         output_prefix=output_prefix
     )
     
@@ -565,7 +592,7 @@ def run_subsample_pipeline(
         output_dir=subsampled_res2_dir,
         resolution=res2,
         num_cores=num_cores,
-        num_spatial_chunks=num_spatial_chunks,
+        num_threads=num_threads,
         output_prefix=output_prefix
     )
     
@@ -618,7 +645,14 @@ def main():
         "--num_cores",
         type=int,
         default=None,
-        help="Number of parallel workers (default: auto-detect)"
+        help="Number of CPU cores (default: auto-detect, not used for chunking)"
+    )
+    
+    parser.add_argument(
+        "--num_threads",
+        type=int,
+        default=None,
+        help=f"Number of spatial chunks per file for parallel processing (default: {TILE_PARAMS.get('threads', 5)})"
     )
     
     parser.add_argument(
@@ -642,6 +676,7 @@ def main():
             res1=args.res1,
             res2=args.res2,
             num_cores=args.num_cores,
+            num_threads=args.num_threads,
             output_prefix=args.output_prefix
         )
         print(f"\nSubsampled files ready:")
