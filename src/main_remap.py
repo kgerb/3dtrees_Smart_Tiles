@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-Main remap script: Remap predictions from 10cm to target resolution (default: 2cm).
+Main remap script: Remap predictions by matching spatial bounds.
 
-This script handles remapping of segmented predictions from coarse resolution
-back to finer resolution using KDTree nearest neighbor lookup.
+This script handles remapping of segmented predictions from source files to target files
+by matching files based on their spatial boundaries, then using KDTree nearest neighbor
+lookup to transfer attributes.
 
 Usage:
-    python main_remap.py --subsampled_10cm_folder /path/to/10cm --target_resolution 2
+    python main_remap.py --source_folder /path/to/segmented --target_folder /path/to/2cm --output_folder /path/to/output
 """
 
 from __future__ import annotations
@@ -19,30 +20,62 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 import numpy as np
+import laspy
+from scipy.spatial import cKDTree  
 
-try:
-    import laspy
-    from scipy.spatial import KDTree
-except ImportError as e:
-    print(f"Missing dependency: {e}")
-    print("Install with: pip install laspy scipy numpy")
-    sys.exit(1)
+from parameters import REMAP_PARAMS
 
-# Import parameters
-try:
-    from parameters import REMAP_PARAMS
-except ImportError:
-    REMAP_PARAMS = {
-        'target_resolution_cm': 2,
-        'workers': 4,
-    }
+
+def get_file_bounds(filepath: Path) -> Optional[Tuple[float, float, float, float]]:
+    """
+    Get spatial bounds of a point cloud file using laspy header only (no point loading).
+    
+    Args:
+        filepath: Path to LAZ file
+    
+    Returns:
+        Tuple of (minx, maxx, miny, maxy) or None on error
+    """
+    try:
+        # Use laspy.open() to read only header, not all points
+        with laspy.open(str(filepath), laz_backend=laspy.LazBackend.LazrsParallel) as las:
+            return (las.header.x_min, las.header.x_max, las.header.y_min, las.header.y_max)
+    except Exception:
+        return None
+
+
+def bounds_match(
+    bounds1: Tuple[float, float, float, float],
+    bounds2: Tuple[float, float, float, float],
+    tolerance: float = 5.0
+) -> bool:
+    """
+    Check if two bounds match within tolerance.
+    
+    Args:
+        bounds1: Tuple of (minx, maxx, miny, maxy) for first file
+        bounds2: Tuple of (minx, maxx, miny, maxy) for second file
+        tolerance: Maximum difference in meters for each bound component
+    
+    Returns:
+        True if all bound components match within tolerance
+    """
+    if bounds1 is None or bounds2 is None:
+        return False
+    
+    minx1, maxx1, miny1, maxy1 = bounds1
+    minx2, maxx2, miny2, maxy2 = bounds2
+    
+    return (abs(minx1 - minx2) <= tolerance and
+            abs(maxx1 - maxx2) <= tolerance and
+            abs(miny1 - miny2) <= tolerance and
+            abs(maxy1 - maxy2) <= tolerance)
 
 
 def remap_single_tile(
     segmented_file: Path,
     target_file: Path,
-    output_file: Path,
-    workers: int = -1
+    output_file: Path
 ) -> Tuple[str, bool, str, int]:
     """
     Remap predictions from segmented file to target resolution file.
@@ -54,7 +87,6 @@ def remap_single_tile(
         segmented_file: Path to segmented LAZ file (e.g., 10cm with predictions)
         target_file: Path to target resolution LAZ file (e.g., 2cm)
         output_file: Path for output LAZ file
-        workers: Number of workers for KDTree queries (-1 = all CPUs)
     
     Returns:
         Tuple of (tile_id, success, message, point_count)
@@ -63,6 +95,7 @@ def remap_single_tile(
     
     try:
         # Load segmented point cloud (source of predictions)
+        print(f"    Loading segmented file...")
         segmented_las = laspy.read(
             str(segmented_file), 
             laz_backend=laspy.LazBackend.LazrsParallel
@@ -72,8 +105,10 @@ def remap_single_tile(
             segmented_las.y, 
             segmented_las.z
         )).T
+        print(f"    Segmented file: {len(segmented_points):,} points")
         
         # Load target resolution point cloud
+        print(f"    Loading target file...")
         target_las = laspy.read(
             str(target_file), 
             laz_backend=laspy.LazBackend.LazrsParallel
@@ -83,6 +118,7 @@ def remap_single_tile(
             target_las.y, 
             target_las.z
         )).T
+        print(f"    Target file: {len(target_points):,} points")
         
         # Check for required attributes in segmented file
         extra_dims = {dim.name for dim in segmented_las.point_format.extra_dimensions}
@@ -93,11 +129,15 @@ def remap_single_tile(
         if not has_pred_instance:
             return (tile_id, False, "No PredInstance attribute in segmented file", 0)
         
-        # Create KDTree from segmented points
-        tree = KDTree(segmented_points)
+        # Create KDTree from segmented points with progress indication
+        print(f"    Building KDTree from {len(segmented_points):,} points...", end="", flush=True)
+        tree = cKDTree(segmented_points)
+        print(" ✓")
         
         # Query nearest neighbors
+        print(f"    Querying nearest neighbors for {len(target_points):,} points...", end="", flush=True)
         distances, indices = tree.query(target_points, workers=-1)
+        print(" ✓")
         
         # Create output with target resolution points
         # Add extra dimensions if they don't exist
@@ -147,77 +187,96 @@ def remap_single_tile(
 
 
 def find_matching_files(
-    results_dir: Path,
+    source_folder: Path,
     target_folder: Path,
-    target_resolution_m: float
+    tolerance: float = 5.0
 ) -> List[Tuple[Path, Path, str]]:
     """
-    Find matching segmented and target resolution files.
+    Find matching files between source and target folders by comparing spatial bounds.
     
     Args:
-        results_dir: Directory containing *_results folders with segmented_pc.laz
-        target_folder: Directory containing target resolution files
-        target_resolution_m: Target resolution in meters
+        source_folder: Directory containing source LAZ files (e.g., segmented files)
+        target_folder: Directory containing target LAZ files (e.g., 2cm subsampled files)
+        tolerance: Maximum difference in meters for bounds matching (default: 5.0)
     
     Returns:
-        List of (segmented_file, target_file, tile_id) tuples
+        List of (source_file, target_file, tile_id) tuples
     """
     matches = []
     
-    # Find all results directories
-    results_dirs = sorted(results_dir.glob("*_results"))
+    # Get all LAZ files from both folders (flat structure)
+    source_files = sorted(source_folder.glob("*.laz"))
+    target_files = sorted(target_folder.glob("*.laz"))
     
-    for result_dir in results_dirs:
-        # Get tile ID from directory name (e.g., c00_r00)
-        dir_name = result_dir.name
-        match = re.search(r'(c\d+_r\d+)', dir_name)
-        if not match:
+    if not source_files:
+        print(f"  Warning: No LAZ files found in source folder: {source_folder}")
+        return matches
+    
+    if not target_files:
+        print(f"  Warning: No LAZ files found in target folder: {target_folder}")
+        return matches
+    
+    print(f"  Found {len(source_files)} source files and {len(target_files)} target files")
+    
+    # Extract bounds for all target files once
+    target_bounds_map = {}
+    for target_file in target_files:
+        bounds = get_file_bounds(target_file)
+        if bounds:
+            target_bounds_map[target_file] = bounds
+    
+    # Match each source file to target files by bounds
+    for source_file in source_files:
+        source_bounds = get_file_bounds(source_file)
+        if source_bounds is None:
+            print(f"  Warning: Could not extract bounds from {source_file.name}")
             continue
         
-        tile_id = match.group(1)
+        # Find matching target file(s)
+        matched_targets = []
+        for target_file, target_bounds in target_bounds_map.items():
+            if bounds_match(source_bounds, target_bounds, tolerance):
+                matched_targets.append(target_file)
         
-        # Path to segmented file
-        segmented_file = result_dir / "segmented_pc.laz"
-        if not segmented_file.exists():
+        if len(matched_targets) == 0:
+            print(f"  Warning: No matching target file found for {source_file.name}")
             continue
+        elif len(matched_targets) > 1:
+            print(f"  Warning: Multiple target files match {source_file.name}, using first match")
         
-        # Find matching target resolution file
-        # Try multiple naming patterns
-        patterns = [
-            f"{tile_id}.copc_subsampled{target_resolution_m}m.laz",
-            f"{tile_id}*_subsampled{target_resolution_m}m.laz",
-            f"*{tile_id}*.laz",
-        ]
+        # Use first match
+        target_file = matched_targets[0]
         
-        target_file = None
-        for pattern in patterns:
-            matches_found = list(target_folder.glob(pattern))
-            if matches_found:
-                target_file = matches_found[0]
-                break
+        # Extract tile_id from filename if possible, otherwise use stem
+        tile_id_match = re.search(r'(c\d+_r\d+)', source_file.stem)
+        if tile_id_match:
+            tile_id = tile_id_match.group(1)
+        else:
+            # Fallback: use filename stem without extension
+            tile_id = source_file.stem.replace('_segmented', '').replace('_results', '')
         
-        if target_file and target_file.exists():
-            matches.append((segmented_file, target_file, tile_id))
+        matches.append((source_file, target_file, tile_id))
+        print(f"  Matched: {source_file.name} <-> {target_file.name}")
     
     return matches
 
 
 def remap_all_tiles(
-    subsampled_10cm_dir: Path,
-    target_resolution_cm: int = 2,
-    subsampled_target_folder: Optional[Path] = None,
-    output_folder: Optional[Path] = None,
-    num_threads: int = 4
+    source_folder: Path,
+    target_folder: Path,
+    output_folder: Path,
+    tolerance: float = 5.0
 ) -> Path:
     """
-    Remap predictions from 10cm to target resolution for all tiles.
+    Remap predictions from source files to target files for all tiles.
+    
+    Matches files between source and target folders by comparing spatial bounds.
     
     Args:
-        subsampled_10cm_dir: Path to folder containing *_results directories
-        target_resolution_cm: Target resolution in cm (default: 2)
-        subsampled_target_folder: Path to target resolution folder (auto-derived if None)
-        output_folder: Output folder for remapped files (auto-derived if None)
-        num_threads: Number of workers for KDTree queries
+        source_folder: Path to folder containing source LAZ files (e.g., segmented files)
+        target_folder: Path to folder containing target LAZ files (e.g., 2cm subsampled files)
+        output_folder: Output folder for remapped files
+        tolerance: Maximum difference in meters for bounds matching (default: 5.0)
     
     Returns:
         Path to output folder
@@ -225,70 +284,30 @@ def remap_all_tiles(
     print("=" * 60)
     print("3DTrees Remap Pipeline")
     print("=" * 60)
-    
-    # Auto-derive paths if not provided
-    if subsampled_target_folder is None:
-        # Replace "subsampled_10cm" with "subsampled_{target}cm"
-        folder_name = subsampled_10cm_dir.name
-        new_name = folder_name.replace("10cm", f"{target_resolution_cm}cm")
-        subsampled_target_folder = subsampled_10cm_dir.parent / new_name
-    
-    if output_folder is None:
-        # Create segmented_remapped folder at same level
-        output_folder = subsampled_10cm_dir.parent / "segmented_remapped"
-    
-    print(f"Input (10cm): {subsampled_10cm_dir}")
-    print(f"Target ({target_resolution_cm}cm): {subsampled_target_folder}")
-    print(f"Output: {output_folder}")
-    print(f"Workers: {num_threads}")
+    print(f"Source folder: {source_folder}")
+    print(f"Target folder: {target_folder}")
+    print(f"Output folder: {output_folder}")
+    print(f"Bounds tolerance: {tolerance}m")
     print()
     
     # Validate directories exist
-    if not subsampled_10cm_dir.exists():
-        raise ValueError(f"Input directory not found: {subsampled_10cm_dir}")
+    if not source_folder.exists():
+        raise ValueError(f"Source directory not found: {source_folder}")
     
-    if not subsampled_target_folder.exists():
-        raise ValueError(f"Target directory not found: {subsampled_target_folder}")
+    if not target_folder.exists():
+        raise ValueError(f"Target directory not found: {target_folder}")
     
     # Create output directory
     output_folder.mkdir(parents=True, exist_ok=True)
     
-    # Convert resolution to meters
-    target_resolution_m = target_resolution_cm / 100.0
-    
-    # Find matching files
-    matches = find_matching_files(
-        subsampled_10cm_dir, 
-        subsampled_target_folder, 
-        target_resolution_m
-    )
+    # Find matching files by bounds
+    print("Matching files by spatial bounds...")
+    matches = find_matching_files(source_folder, target_folder, tolerance)
     
     if not matches:
-        # Try alternative: direct LAZ files in the 10cm folder
-        print("  Looking for direct LAZ files...")
-        segmented_files = list(subsampled_10cm_dir.glob("*_segmented*.laz"))
-        
-        for seg_file in segmented_files:
-            tile_id_match = re.search(r'(c\d+_r\d+)', seg_file.name)
-            if not tile_id_match:
-                continue
-            tile_id = tile_id_match.group(1)
-            
-            # Find target file
-            target_patterns = [
-                f"*{tile_id}*.laz",
-            ]
-            
-            for pattern in target_patterns:
-                target_files = list(subsampled_target_folder.glob(pattern))
-                if target_files:
-                    matches.append((seg_file, target_files[0], tile_id))
-                    break
+        raise ValueError(f"No matching source/target file pairs found (tolerance: {tolerance}m)")
     
-    if not matches:
-        raise ValueError(f"No matching segmented/target file pairs found")
-    
-    print(f"Found {len(matches)} tiles to remap")
+    print(f"Found {len(matches)} matching file pairs")
     print()
     
     # Process each tile
@@ -296,8 +315,18 @@ def remap_all_tiles(
     failed = 0
     total_points = 0
     
-    for i, (segmented_file, target_file, tile_id) in enumerate(matches, 1):
-        print(f"[{i}/{len(matches)}] Processing tile {tile_id}...")
+    for i, (source_file, target_file, tile_id) in enumerate(matches, 1):
+        # Get point count from target file header for display
+        target_bounds = get_file_bounds(target_file)
+        target_header = None
+        try:
+            with laspy.open(str(target_file), laz_backend=laspy.LazBackend.LazrsParallel) as las:
+                target_header = las.header
+        except Exception:
+            pass
+        
+        point_count_display = f"{target_header.point_count:,} points" if target_header else "points"
+        print(f"[{i}/{len(matches)}] Processing tile {tile_id} ({point_count_display})...")
         
         output_file = output_folder / f"{tile_id}_segmented_remapped.laz"
         
@@ -308,16 +337,15 @@ def remap_all_tiles(
             continue
         
         tile_id_result, success, message, point_count = remap_single_tile(
-            segmented_file,
+            source_file,
             target_file,
-            output_file,
-            workers=num_threads
+            output_file
         )
         
         if success:
             successful += 1
             total_points += point_count
-            print(f"  ✓ {point_count:,} points")
+            print(f"  ✓ Completed: {point_count:,} points")
         else:
             failed += 1
             print(f"  ✗ {message}")
@@ -338,43 +366,44 @@ def remap_all_tiles(
 def main():
     """CLI entry point."""
     parser = argparse.ArgumentParser(
-        description="3DTrees Remap Pipeline - Remap predictions to target resolution",
+        description="3DTrees Remap Pipeline - Remap predictions by matching spatial bounds",
         formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Remap files matching by bounds
+  python main_remap.py --source_folder /path/to/segmented --target_folder /path/to/2cm --output_folder /path/to/output
+  
+  # Remap with custom tolerance
+  python main_remap.py --source_folder /path/to/segmented --target_folder /path/to/2cm --output_folder /path/to/output --tolerance 10.0
+        """
     )
     
     parser.add_argument(
-        "--subsampled_10cm_folder",
+        "--source_folder",
         type=Path,
         required=True,
-        help="Path to folder containing *_results directories or segmented LAZ files"
+        help="Path to folder containing source LAZ files (e.g., segmented files with predictions)"
     )
     
     parser.add_argument(
-        "--target_resolution",
-        type=int,
-        default=REMAP_PARAMS.get('target_resolution_cm', 2),
-        help=f"Target resolution in cm (default: {REMAP_PARAMS.get('target_resolution_cm', 2)})"
-    )
-    
-    parser.add_argument(
-        "--subsampled_target_folder",
+        "--target_folder",
         type=Path,
-        default=None,
-        help="Path to target resolution folder (auto-derived if not specified)"
+        required=True,
+        help="Path to folder containing target LAZ files (e.g., 2cm subsampled files)"
     )
     
     parser.add_argument(
         "--output_folder",
         type=Path,
-        default=None,
-        help="Output folder for remapped files (auto-derived if not specified)"
+        required=True,
+        help="Output folder for remapped files"
     )
     
     parser.add_argument(
-        "--workers",
-        type=int,
-        default=REMAP_PARAMS.get('workers', 4),
-        help=f"Number of workers for KDTree queries (default: {REMAP_PARAMS.get('workers', 4)})"
+        "--tolerance",
+        type=float,
+        default=5.0,
+        help="Maximum difference in meters for bounds matching (default: 5.0)"
     )
     
     args = parser.parse_args()
@@ -382,11 +411,10 @@ def main():
     # Run pipeline
     try:
         output_folder = remap_all_tiles(
-            subsampled_10cm_dir=args.subsampled_10cm_folder,
-            target_resolution_cm=args.target_resolution,
-            subsampled_target_folder=args.subsampled_target_folder,
+            source_folder=args.source_folder,
+            target_folder=args.target_folder,
             output_folder=args.output_folder,
-            num_threads=args.workers
+            tolerance=args.tolerance
         )
         print(f"\nRemapped files ready: {output_folder}")
     except Exception as e:
