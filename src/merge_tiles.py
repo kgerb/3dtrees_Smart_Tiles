@@ -50,6 +50,7 @@ class TileData:
     species_ids: np.ndarray
     boundary: Tuple[float, float, float, float]  # min_x, max_x, min_y, max_y
     species_prob: Optional[np.ndarray] = None  # Species probability (if available)
+    has_species_id: bool = False  # Whether species_id was present in input file
     # Note: las field removed to save memory - was never used after loading
 
 
@@ -421,6 +422,7 @@ def load_tile(
             instances=instances,
             species_ids=species_ids,
             species_prob=species_prob,
+            has_species_id=has_species_id,
             boundary=boundary,
         ),
         instances_to_remove,
@@ -894,7 +896,7 @@ def merge_small_volume_instances(
     instance_species_map: Dict[int, int],
     instance_species_prob_map: Dict[int, float],
     min_points_for_hull_check: int = 1000,
-    min_points_for_redistribute: int = 500,
+    min_cluster_size: int = 300,
     max_volume_for_merge: float = 4.0,
     max_search_radius: float = 5.0,
     num_threads: int = 1,
@@ -910,7 +912,7 @@ def merge_small_volume_instances(
     - For instances with < min_points_for_hull_check (1000) points:
       1. Calculate convex hull volume
       2. If volume < max_volume_for_merge (4.0 m³): Merge to nearest large instance
-      3. Else if point_count < min_points_for_redistribute (500): Redistribute to nearest instance
+      3. Else if point_count < min_cluster_size: Redistribute to nearest instance
       4. Else: Keep instance
 
     Species ID and species_prob are taken from the target (larger) instance.
@@ -923,7 +925,7 @@ def merge_small_volume_instances(
         instance_species_map: Mapping of instance ID to species ID
         instance_species_prob_map: Mapping of instance ID to species probability
         min_points_for_hull_check: Only compute convex hull for instances with fewer points than this (default: 1000)
-        min_points_for_redistribute: Redistribute instances with fewer points than this if volume >= threshold (default: 500)
+        min_cluster_size: Redistribute instances with fewer points than this if volume >= threshold (default: 300)
         max_volume_for_merge: Merge instances with convex hull volume below this (m³) (default: 4.0)
         max_search_radius: Max distance to search for target instance (m) (default: 5.0)
         num_threads: Number of workers for parallel hull computation (default: 1)
@@ -978,13 +980,6 @@ def merge_small_volume_instances(
             large_instances.append((inst_id, count, centroid))
             continue
 
-        # Skip too-small instances (can't compute hull)
-        if count < 4:
-            end = start + count
-            centroid = sorted_points[start:end].mean(axis=0)
-            large_instances.append((inst_id, count, centroid))
-            continue
-
         # For instances < 1000 points: compute bbox volume without extracting points array
         # This avoids memory copies for instances that will be filtered out
         end = start + count
@@ -994,18 +989,28 @@ def merge_small_volume_instances(
         )
 
         # If bounding box volume is already too large, skip convex hull computation
-        # Note: We still need centroid for large_instances, so compute it here
+        # But still check point count - sparse large-bbox instances should be redistributed
         if (
             bbox_volume >= max_volume_for_merge * 4.0
         ):  # Conservative threshold (bbox >= 4x target)
-            # Only compute centroid if we're keeping this instance
             centroid = sorted_points[start:end].mean(axis=0)
-            large_instances.append((inst_id, count, centroid))
-            bbox_skipped_count += 1
-            if verbose:
-                print(
-                    f"    Instance {inst_id}: {count} pts, bbox {bbox_volume:.2f} m³ - keeping (bbox too large)"
-                )
+            
+            # Check if instance has too few points - redistribute sparse noise
+            if count < min_cluster_size:
+                small_point_count_instances.append((inst_id, count, centroid))
+                bbox_skipped_count += 1
+                if verbose:
+                    print(
+                        f"    Instance {inst_id}: {count} pts, bbox {bbox_volume:.2f} m³ - REDISTRIBUTE (sparse, < {min_cluster_size} pts)"
+                    )
+            else:
+                # Large bbox with enough points - keep as large instance
+                large_instances.append((inst_id, count, centroid))
+                bbox_skipped_count += 1
+                if verbose:
+                    print(
+                        f"    Instance {inst_id}: {count} pts, bbox {bbox_volume:.2f} m³ - keeping (bbox too large, enough points)"
+                    )
             continue
 
         # Collect candidates for hull computation (< min_points_for_hull_check, passed bbox filter)
@@ -1082,12 +1087,12 @@ def merge_small_volume_instances(
                     )
             else:
                 # Volume >= threshold - check point count for redistribution
-                if count < min_points_for_redistribute:
+                if count < min_cluster_size:
                     # Small point count - redistribute to nearest instance
                     small_point_count_instances.append((inst_id, count, centroid))
                     if verbose:
                         print(
-                            f"    Instance {inst_id}: {count} pts, {volume:.2f} m³ - REDISTRIBUTE (< {min_points_for_redistribute} pts)"
+                            f"    Instance {inst_id}: {count} pts, {volume:.2f} m³ - REDISTRIBUTE (< {min_cluster_size} pts)"
                         )
                 else:
                     # Keep instance
@@ -1136,7 +1141,7 @@ def merge_small_volume_instances(
     )
     if len(small_point_count_instances) > 0:
         print(
-            f"  Found {len(small_point_count_instances)} small point-count instances (< {min_points_for_redistribute} pts, volume >= {max_volume_for_merge} m³) to redistribute"
+            f"  Found {len(small_point_count_instances)} small point-count instances (< {min_cluster_size} pts, volume >= {max_volume_for_merge} m³) to redistribute"
         )
     if bbox_skipped_count > 0:
         print(
@@ -1239,7 +1244,7 @@ def merge_small_volume_instances(
 
 def load_merged_file(
     merged_file: Path, chunk_size: int = 1_000_000
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, bool]:
     """
     Load merged point cloud data from an existing LAZ file.
 
@@ -1248,7 +1253,7 @@ def load_merged_file(
         chunk_size: Number of points to read per chunk (default 1M)
 
     Returns:
-        Tuple of (points, instances, species_ids) as numpy arrays
+        Tuple of (points, instances, species_ids, has_species_id) as numpy arrays and bool
     """
     print(f"Loading existing merged file: {merged_file}")
 
@@ -1296,8 +1301,12 @@ def load_merged_file(
 
         unique_instances = len(np.unique(instances[instances > 0]))
         print(f"  Loaded {len(points):,} points, {unique_instances} unique instances")
+        if has_species_id:
+            print(f"  Species ID: Found in merged file")
+        else:
+            print(f"  Species ID: Not found in merged file")
 
-        return points, instances, species_ids
+        return points, instances, species_ids, has_species_id
 
     except Exception as e:
         raise ValueError(f"Error loading merged file {merged_file}: {e}")
@@ -1317,6 +1326,7 @@ def retile_to_original_files(
     tolerance: float = 0.1,
     num_threads: int = 8,
     chunk_size: int = 1_000_000,
+    all_have_species_id: bool = True,
 ):
     """
     Map merged instance IDs back to original tile point clouds.
@@ -1428,13 +1438,15 @@ def retile_to_original_files(
             orig_las.add_extra_dim(
                 laspy.ExtraBytesParams(name="PredInstance", type=np.int32)
             )
-        if "species_id" not in extra_dims:
-            orig_las.add_extra_dim(
-                laspy.ExtraBytesParams(name="species_id", type=np.int32)
-            )
-
         orig_las.PredInstance = new_instances
-        orig_las.species_id = new_species
+
+        # Only add species_id if it was present in all input files
+        if all_have_species_id:
+            if "species_id" not in extra_dims:
+                orig_las.add_extra_dim(
+                    laspy.ExtraBytesParams(name="species_id", type=np.int32)
+                )
+            orig_las.species_id = new_species
 
         # Save to output directory (output_file already defined above)
         orig_las.write(
@@ -1480,6 +1492,7 @@ def merge_tiles(
     enable_matching: bool = True,
     require_overlap: bool = True,
     enable_volume_merge: bool = True,
+    skip_merged_file: bool = False,
     verbose: bool = False,
 ):
     """
@@ -1490,7 +1503,7 @@ def merge_tiles(
     print("=" * 60)
     print(f"Input directory: {input_dir}")
     print(f"Original tiles: {original_tiles_dir}")
-    print(f"Output merged: {output_merged}")
+    print(f"Output merged: {output_merged}" + (" (SKIPPED)" if skip_merged_file else ""))
     print(f"Output tiles: {output_tiles_dir}")
     print(f"Buffer: {buffer}m")
     print(f"Instance matching: {'ENABLED' if enable_matching else 'DISABLED'}")
@@ -1515,7 +1528,7 @@ def merge_tiles(
         print(f"{'=' * 60}")
         print("  Loading merged file and proceeding to retiling stage...")
         
-        merged_points, merged_instances, merged_species_ids = load_merged_file(
+        merged_points, merged_instances, merged_species_ids, all_have_species_id = load_merged_file(
             output_merged
         )
 
@@ -1528,6 +1541,7 @@ def merge_tiles(
             output_tiles_dir,
             tolerance=0.1,
             num_threads=num_threads,
+            all_have_species_id=all_have_species_id,
         )
 
         print(f"\n{'=' * 60}")
@@ -1605,6 +1619,14 @@ def merge_tiles(
     if len(tiles) == 0:
         print("No tiles loaded successfully")
         return
+    
+    # Check if ALL tiles have species_id (only include if present in all input files)
+    all_have_species_id = all(tile.has_species_id for tile in tiles)
+    if all_have_species_id:
+        print(f"  Species ID: Found in all input files (will be included in output)")
+    else:
+        tiles_with = sum(1 for tile in tiles if tile.has_species_id)
+        print(f"  Species ID: Only found in {tiles_with}/{len(tiles)} input files (will be omitted from output)")
     
     total_points = sum(len(tile.points) for tile in tiles)
     total_kept = sum(len(kept) for kept in kept_instances_per_tile.values())
@@ -2455,7 +2477,7 @@ def merge_tiles(
                 final_species_map,
                 final_species_prob_map,
                 min_points_for_hull_check=1000,
-                min_points_for_redistribute=500,
+                min_cluster_size=min_cluster_size,
                 max_volume_for_merge=max_volume_for_merge,
                 max_search_radius=5.0,
                 num_threads=num_threads,
@@ -2484,54 +2506,75 @@ def merge_tiles(
         old_to_new[old_id] = new_id
         new_species_map[new_id] = final_species_map.get(old_id, 0)
 
-    merged_instances = np.array(
-        [old_to_new.get(x, 0) for x in merged_instances], dtype=np.int32
-    )
-
-    # Update species IDs based on new instance numbering
+    # Vectorized remapping using numpy lookup tables - O(n) instead of O(k*n) loop
+    max_old_id = int(merged_instances.max()) + 1
+    max_new_id = len(unique_instances) + 1
+    
+    # Lookup table: old_id → new_id
+    instance_lookup = np.zeros(max_old_id, dtype=np.int32)
+    for old_id, new_id in old_to_new.items():
+        if old_id < max_old_id:
+            instance_lookup[old_id] = new_id
+    
+    # Lookup table: new_id → species_id
+    species_lookup = np.zeros(max_new_id, dtype=np.int32)
     for new_id, species in new_species_map.items():
-        mask = merged_instances == new_id
-        merged_species_ids[mask] = species
+        if new_id < max_new_id:
+            species_lookup[new_id] = species
+    
+    # Vectorized remapping: O(n) single pass
+    merged_instances = instance_lookup[merged_instances]
+    merged_species_ids = species_lookup[merged_instances]
 
     print(f"  Final instance count: {len(unique_instances)}")
 
     # =========================================================================
-    # Save merged output
+    # Save merged output (optional - can be skipped with skip_merged_file=True)
     # =========================================================================
-    print(f"\n{'=' * 60}")
-    print("Saving merged output")
-    print(f"{'=' * 60}")
+    if skip_merged_file:
+        print(f"\n{'=' * 60}")
+        print("Saving merged output (SKIPPED)")
+        print(f"{'=' * 60}")
+        print(f"  Skipped merged LAZ file creation (--skip_merged_file)")
+        print(f"  Total points: {len(merged_points):,}")
+        print(f"  Total instances: {len(unique_instances)}")
+    else:
+        print(f"\n{'=' * 60}")
+        print("Saving merged output")
+        print(f"{'=' * 60}")
 
-    output_merged.parent.mkdir(parents=True, exist_ok=True)
+        output_merged.parent.mkdir(parents=True, exist_ok=True)
 
-    header = laspy.LasHeader(point_format=6, version="1.4")
-    header.offsets = np.min(merged_points, axis=0)
-    header.scales = np.array([0.001, 0.001, 0.001])
+        header = laspy.LasHeader(point_format=6, version="1.4")
+        header.offsets = np.min(merged_points, axis=0)
+        header.scales = np.array([0.001, 0.001, 0.001])
 
-    output_las = laspy.LasData(header)
-    output_las.x = merged_points[:, 0]
-    output_las.y = merged_points[:, 1]
-    output_las.z = merged_points[:, 2]
+        output_las = laspy.LasData(header)
+        output_las.x = merged_points[:, 0]
+        output_las.y = merged_points[:, 1]
+        output_las.z = merged_points[:, 2]
 
-    output_las.add_extra_dim(laspy.ExtraBytesParams(name="PredInstance", type=np.int32))
-    output_las.add_extra_dim(laspy.ExtraBytesParams(name="species_id", type=np.int32))
+        output_las.add_extra_dim(laspy.ExtraBytesParams(name="PredInstance", type=np.int32))
+        output_las.PredInstance = merged_instances
 
-    output_las.PredInstance = merged_instances
-    output_las.species_id = merged_species_ids
+        # Only add species_id if it was present in all input files
+        if all_have_species_id:
+            output_las.add_extra_dim(laspy.ExtraBytesParams(name="species_id", type=np.int32))
+            output_las.species_id = merged_species_ids
 
-    # Note: species_prob is NOT saved to LAZ file, but to a separate CSV instead
+        # Note: species_prob is NOT saved to LAZ file, but to a separate CSV instead
 
-    output_las.write(
-        str(output_merged), do_compress=True, laz_backend=laspy.LazBackend.LazrsParallel
-    )
+        output_las.write(
+            str(output_merged), do_compress=True, laz_backend=laspy.LazBackend.LazrsParallel
+        )
 
-    # Clean up output LasData object
-    del output_las
-    gc.collect()
+        # Clean up output LasData object
+        del output_las
+        gc.collect()
 
-    print(f"  Saved merged output: {output_merged}")
-    print(f"  Total points: {len(merged_points):,}")
-    print(f"  Total instances: {len(unique_instances)}")
+        print(f"  Saved merged output: {output_merged}")
+        print(f"  Total points: {len(merged_points):,}")
+        print(f"  Total instances: {len(unique_instances)}")
 
     # =========================================================================
     # Create CSV with instance metadata (PredInstance, species_id, has_added_clusters)
@@ -2557,21 +2600,27 @@ def merge_tiles(
     
     with open(csv_output_path, "w", newline="") as csvfile:
         writer = csv.writer(csvfile)
-        writer.writerow([
-            "PredInstance",
-            "species_id",
-            "has_added_clusters"
-        ])
+        # Header - conditionally include species_id
+        if all_have_species_id:
+            writer.writerow(["PredInstance", "species_id", "has_added_clusters"])
+        else:
+            writer.writerow(["PredInstance", "has_added_clusters"])
         
         # Write one row per unique instance ID
         for final_id in sorted(unique_instances):
             has_clusters = final_id in instances_with_clusters
             
-            writer.writerow([
-                final_id,
-                new_species_map.get(final_id, 0),
-                1 if has_clusters else 0
-            ])
+            if all_have_species_id:
+                writer.writerow([
+                    final_id,
+                    new_species_map.get(final_id, 0),
+                    1 if has_clusters else 0
+                ])
+            else:
+                writer.writerow([
+                    final_id,
+                    1 if has_clusters else 0
+                ])
     
     # Clean up dictionaries used for CSV (no longer needed)
     del merged_species
@@ -2594,6 +2643,7 @@ def merge_tiles(
         output_tiles_dir,
         tolerance=0.1,
         num_threads=num_threads,
+        all_have_species_id=all_have_species_id,
     )
     print(f"  ✓ Stage 6 completed: Retiled to original files")
 
@@ -2710,6 +2760,12 @@ def main():
     )
 
     parser.add_argument(
+        "--skip-merged-file",
+        action="store_true",
+        help="Skip creating merged LAZ file (only create retiled outputs)",
+    )
+
+    parser.add_argument(
         "--verbose", "-v", action="store_true", help="Print detailed merge decisions"
     )
 
@@ -2729,6 +2785,7 @@ def main():
         enable_matching=not args.disable_matching,
         require_overlap=not args.disable_overlap_check,
         enable_volume_merge=not args.disable_volume_merge,
+        skip_merged_file=args.skip_merged_file,
         verbose=args.verbose,
     )
 

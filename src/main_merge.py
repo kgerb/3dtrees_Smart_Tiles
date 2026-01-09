@@ -59,6 +59,7 @@ def run_merge(
     enable_matching: bool = True,
     require_overlap: bool = True,
     enable_volume_merge: bool = True,
+    skip_merged_file: bool = False,
     verbose: bool = True,
 ) -> Path:
     """
@@ -78,6 +79,7 @@ def run_merge(
         enable_matching: Enable cross-tile instance matching
         require_overlap: Require overlap ratio check (vs centroid distance only)
         enable_volume_merge: Enable small volume instance merging
+        skip_merged_file: Skip creating merged LAZ file (only retile)
         verbose: Print detailed merge decisions
     
     Returns:
@@ -102,7 +104,7 @@ def run_merge(
         output_merged = segmented_dir.parent / "merged.laz"
     
     print(f"Input: {segmented_dir}")
-    print(f"Output: {output_merged}")
+    print(f"Output merged: {output_merged}" + (" (SKIPPED)" if skip_merged_file else ""))
     print(f"Buffer: {buffer}m")
     print(f"Instance matching: {'ENABLED' if enable_matching else 'DISABLED'}")
     if enable_matching:
@@ -138,6 +140,7 @@ def run_merge(
         enable_matching=enable_matching,
         require_overlap=require_overlap,
         enable_volume_merge=enable_volume_merge,
+        skip_merged_file=skip_merged_file,
         verbose=verbose,
     )
     
@@ -247,6 +250,12 @@ def main():
     )
     
     parser.add_argument(
+        "--skip_merged_file",
+        action="store_true",
+        help="Skip creating merged LAZ file (only create retiled outputs)"
+    )
+    
+    parser.add_argument(
         "--verbose", "-v",
         action="store_true",
         help="Print detailed merge decisions"
@@ -259,21 +268,23 @@ def main():
         output_file = run_merge(
             segmented_dir=args.segmented_folder,
             output_merged=args.output_merged,
-        output_tiles_dir=args.output_tiles_dir,
-        original_tiles_dir=args.original_tiles_dir,
-        buffer=args.buffer,
-        overlap_threshold=args.overlap_threshold,
-        max_centroid_distance=args.max_centroid_distance,
-        correspondence_tolerance=args.correspondence_tolerance,
-        max_volume_for_merge=args.max_volume_for_merge,
-        min_cluster_size=args.min_cluster_size,
-        num_threads=args.workers,
+            output_tiles_dir=args.output_tiles_dir,
+            original_tiles_dir=args.original_tiles_dir,
+            buffer=args.buffer,
+            overlap_threshold=args.overlap_threshold,
+            max_centroid_distance=args.max_centroid_distance,
+            correspondence_tolerance=args.correspondence_tolerance,
+            max_volume_for_merge=args.max_volume_for_merge,
+            min_cluster_size=args.min_cluster_size,
+            num_threads=args.workers,
             enable_matching=not args.disable_matching,
             require_overlap=not args.disable_overlap_check,
             enable_volume_merge=not args.disable_volume_merge,
+            skip_merged_file=args.skip_merged_file,
             verbose=args.verbose,
         )
-        print(f"\nMerged output: {output_file}")
+        if not args.skip_merged_file:
+            print(f"\nMerged output: {output_file}")
     except Exception as e:
         print(f"Error: {e}")
         sys.exit(1)
