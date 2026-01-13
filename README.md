@@ -363,36 +363,27 @@ python src/run.py --task tile --input-dir /data/in --output-dir /data/out --skip
 
 **Output**: `{tile_id}_segmented_remapped.laz`
 
-### Stage 8: Buffer Zone Filtering
+### Stage 8: Buffer Zone Filtering & Cross-Tile Instance Matching
 
-**Purpose**: Remove duplicate instances in overlapping buffer zones.
+**Purpose**: Remove duplicate instances in overlapping buffer zones and identify instances that span tile boundaries.
 
-**Algorithm**: Centroid-based filtering
+**Algorithm**: Centroid-based filtering with overlap ratio matching using Union-Find grouping
 
 **Process**:
-1. Compute instance centroids
+1. Compute instance centroids from full tile points (not just border region)
 2. Identify tiles with neighbors (east, west, north, south)
-3. Define buffer zones on edges facing neighbors
-4. Remove entire instances whose centroids fall within buffer zones
-
-### Stage 9: Cross-Tile Instance Matching
-
-**Purpose**: Identify and merge tree instances that span tile boundaries.
-
-**Algorithm**: Overlap ratio with Union-Find grouping
+3. Define border zones on edges facing neighbors (buffer to buffer+`border_zone_width`)
+4. For instances with centroids in border zones:
+   - Match with neighboring tile instances using KDTree overlap ratios
+   - Apply centroid proximity check (`max_centroid_distance`)
+   - Group matched instances using Union-Find
+5. Remove entire instances whose centroids fall within buffer zones
 
 **Matching Criteria**:
 1. **Centroid proximity**: Centroids within `max_centroid_distance` (default: 3m)
 2. **Overlap ratio**: Fraction of points that correspond exceeds `overlap_threshold` (default: 30%)
 
-**Process**:
-1. Find spatially overlapping tiles
-2. For each tile pair, identify boundary instances
-3. Compute overlap ratios using KDTree
-4. Group matched instances using Union-Find
-5. Assign unified global IDs
-
-### Stage 10: Deduplication and Final Merge
+### Stage 9: Deduplication and Final Merge
 
 **Purpose**: Remove duplicate points from buffer regions and create unified output.
 
@@ -404,7 +395,7 @@ python src/run.py --task tile --input-dir /data/in --output-dir /data/out --skip
 3. Keep only the "canonical" copy (from lower tile index)
 4. Write unified LAZ with consistent instance IDs
 
-### Stage 11: Small Volume Merging
+### Stage 10: Small Volume Merging
 
 **Purpose**: Reassign orphaned tree fragments to nearby larger instances.
 
@@ -414,7 +405,7 @@ python src/run.py --task tile --input-dir /data/in --output-dir /data/out --skip
 
 **Species Preservation**: Species ID (if available) is always taken from the larger instance.
 
-### Stage 12: Original File Remapping
+### Stage 11: Original File Remapping
 
 **Purpose**: Map final instance IDs back to the original input LAZ files (pre-tiling).
 
@@ -453,11 +444,13 @@ python src/run.py --task tile --input-dir /data/in --output-dir /data/out --skip
 |-----------|---------|-------------|
 | `--target-resolution` | 2 | Target resolution in cm |
 | `--buffer` | 10.0 | Buffer distance for filtering (meters) |
+| `--border-zone-width` | 10.0 | Width of border zone beyond buffer for instance matching (meters) |
 | `--overlap-threshold` | 0.3 | Overlap ratio for instance matching (30%) |
 | `--max-centroid-distance` | 3.0 | Max centroid distance to merge (meters) |
 | `--correspondence-tolerance` | 0.05 | Point correspondence tolerance (meters) |
 | `--max-volume-for-merge` | 4.0 | Max volume for small instance merge (m³) |
 | `--original-input-dir` | None | Directory with original input LAZ files for final remap |
+| `--skip-merged-file` | False | Skip creating merged LAZ file (only create retiled outputs) |
 | `--workers` | 4 | Parallel processing (tile loading, KDTree queries) |
 
 ### Understanding `--workers` vs `--threads`

@@ -555,7 +555,7 @@ def deduplicate_points(
 
 
 # =============================================================================
-# Stage 3: FF3D Instance Matching
+# Stage 3: FF3D Instance Matching (Border Region Instance Matching)
 # =============================================================================
 
 
@@ -1289,15 +1289,15 @@ def merge_small_volume_instances(
             idx = indices[i]
 
             if distance > max_search_radius:
-                if verbose:
-                    if volume > 0:  # Small volume instance
-                        print(
-                            f"    Cluster {inst_id}: {count} pts, {volume:.2f} m³ → no target within {max_search_radius}m (nearest: {distance:.1f}m)"
-                        )
-                    else:  # Small point count instance
-                        print(
-                            f"    Cluster {inst_id}: {count} pts → no target within {max_search_radius}m (nearest: {distance:.1f}m)"
-                        )
+                # Orphan not recovered - no target within range
+                if volume > 0:  # Small volume instance
+                    print(
+                        f"    ✗ Orphan NOT recovered: Cluster {inst_id} ({count} pts, {volume:.2f} m³) - no target within {max_search_radius}m (nearest: {distance:.1f}m)"
+                    )
+                else:  # Small point count instance
+                    print(
+                        f"    ✗ Orphan NOT recovered: Cluster {inst_id} ({count} pts) - no target within {max_search_radius}m (nearest: {distance:.1f}m)"
+                    )
                 continue
 
             target_inst = large_ids[idx]
@@ -1310,13 +1310,14 @@ def merge_small_volume_instances(
             inst_to_species_prob[inst_id] = target_species_prob
 
             total_merged += count
+            # Orphan recovered - log the reassignment
             if volume > 0:  # Small volume instance
                 print(
-                    f"    Cluster {inst_id} ({count} pts, {volume:.2f} m³) → Instance {target_inst} ({large_sizes[target_inst]} pts, dist: {distance:.1f}m)"
+                    f"    ✓ Orphan recovered: Cluster {inst_id} ({count} pts, {volume:.2f} m³) → Instance {target_inst} ({large_sizes[target_inst]} pts, dist: {distance:.1f}m)"
                 )
             else:  # Small point count instance
                 print(
-                    f"    Cluster {inst_id} ({count} pts) → Instance {target_inst} ({large_sizes[target_inst]} pts, dist: {distance:.1f}m) - redistributed"
+                    f"    ✓ Orphan recovered: Cluster {inst_id} ({count} pts) → Instance {target_inst} ({large_sizes[target_inst]} pts, dist: {distance:.1f}m)"
                 )
     else:
         total_merged = 0
@@ -1484,29 +1485,77 @@ def _process_single_tile(args):
         new_instances[valid_mask] = local_merged_instances[indices[valid_mask]]
         new_species[valid_mask] = local_merged_species[indices[valid_mask]]
 
-        # Add/update extra dimensions
-        extra_dims = {dim.name for dim in orig_las.point_format.extra_dimensions}
-
-        if "PredInstance" not in extra_dims:
-            orig_las.add_extra_dim(
+        # Create a completely fresh header to avoid COPC format issues
+        # (laspy can read COPC but cannot write it - the old header contains COPC VLRs)
+        new_header = laspy.LasHeader(
+            point_format=orig_las.header.point_format,
+            version=orig_las.header.version
+        )
+        new_header.offsets = orig_las.header.offsets
+        new_header.scales = orig_las.header.scales
+        
+        # Create new LasData with fresh header
+        output_las = laspy.LasData(new_header)
+        
+        # Copy all point data from original
+        # We need to copy each dimension individually since point formats may differ
+        output_las.x = orig_las.x
+        output_las.y = orig_las.y
+        output_las.z = orig_las.z
+        
+        # Copy standard dimensions if they exist
+        for dim_name in ['intensity', 'return_number', 'number_of_returns', 
+                         'classification', 'scan_angle_rank', 'user_data',
+                         'point_source_id', 'gps_time', 'red', 'green', 'blue']:
+            if hasattr(orig_las, dim_name):
+                try:
+                    setattr(output_las, dim_name, getattr(orig_las, dim_name))
+                except Exception:
+                    pass  # Skip dimensions that don't exist in target format
+        
+        # Copy existing extra dimensions from original file
+        orig_extra_dims = {dim.name for dim in orig_las.point_format.extra_dimensions}
+        output_extra_dims = {dim.name for dim in output_las.point_format.extra_dimensions}
+        
+        for dim_name in orig_extra_dims:
+            if dim_name not in ['PredInstance', 'species_id']:  # We'll add these fresh
+                try:
+                    # Check if dimension already exists in output
+                    if dim_name not in output_extra_dims:
+                        dim_info = next(d for d in orig_las.point_format.extra_dimensions if d.name == dim_name)
+                        output_las.add_extra_dim(
+                            laspy.ExtraBytesParams(name=dim_name, type=dim_info.dtype)
+                        )
+                        output_extra_dims.add(dim_name)  # Track that we added it
+                    setattr(output_las, dim_name, getattr(orig_las, dim_name))
+                except Exception:
+                    pass  # Skip dimensions that can't be copied
+        
+        # Add PredInstance dimension (check if it already exists)
+        if "PredInstance" not in output_extra_dims:
+            output_las.add_extra_dim(
                 laspy.ExtraBytesParams(name="PredInstance", type=np.int32)
             )
-        orig_las.PredInstance = new_instances
+        output_las.PredInstance = new_instances
 
-        # Only add species_id if it was present in all input files
+        # Only add species_id if it was present in all input files (check if it already exists)
         if all_have_species_id:
-            if "species_id" not in extra_dims:
-                orig_las.add_extra_dim(
+            if "species_id" not in output_extra_dims:
+                output_las.add_extra_dim(
                     laspy.ExtraBytesParams(name="species_id", type=np.int32)
                 )
-            orig_las.species_id = new_species
+            output_las.species_id = new_species
 
-        # Save to output directory
-        orig_las.write(
+        # Save to output directory (as regular LAZ, not COPC)
+        output_las.write(
             str(output_file),
             do_compress=True,
             laz_backend=laspy.LazBackend.LazrsParallel,
         )
+        
+        # Clean up
+        del orig_las
+        del output_las
 
         matched = int(np.sum(valid_mask))
         unique_inst = len(np.unique(new_instances[new_instances > 0]))
@@ -1586,11 +1635,13 @@ def retile_to_original_files(
     spatial_buffer = max(tolerance * 2, 1.0)
 
     # Filter out already-processed files
+    # Note: Change .copc.laz to .laz since laspy cannot write COPC format
     tiles_to_process = []
     for orig_file in original_files:
-        output_file = output_dir / orig_file.name
+        output_name = orig_file.name.replace('.copc.laz', '.laz')
+        output_file = output_dir / output_name
         if output_file.exists():
-            print(f"  Skipping {orig_file.name} (output already exists)", flush=True)
+            print(f"  Skipping {output_name} (output already exists)", flush=True)
         else:
             tiles_to_process.append((orig_file, output_file))
     
@@ -1721,30 +1772,77 @@ def _process_single_original_input_file(args):
         # Count unique non-zero instances
         unique_instances = len(np.unique(new_instances[new_instances > 0]))
 
-        # Add/update extra dimensions
-        extra_dims = {dim.name for dim in input_las.point_format.extra_dimensions}
-
-        if "PredInstance" not in extra_dims:
-            input_las.add_extra_dim(
+        # Create a completely fresh header to avoid COPC format issues
+        # (laspy can read COPC but cannot write it - the old header contains COPC VLRs)
+        new_header = laspy.LasHeader(
+            point_format=input_las.header.point_format,
+            version=input_las.header.version
+        )
+        new_header.offsets = input_las.header.offsets
+        new_header.scales = input_las.header.scales
+        
+        # Create new LasData with fresh header
+        output_las = laspy.LasData(new_header)
+        
+        # Copy all point data from original
+        output_las.x = input_las.x
+        output_las.y = input_las.y
+        output_las.z = input_las.z
+        
+        # Copy standard dimensions if they exist
+        for dim_name in ['intensity', 'return_number', 'number_of_returns', 
+                         'classification', 'scan_angle_rank', 'user_data',
+                         'point_source_id', 'gps_time', 'red', 'green', 'blue']:
+            if hasattr(input_las, dim_name):
+                try:
+                    setattr(output_las, dim_name, getattr(input_las, dim_name))
+                except Exception:
+                    pass  # Skip dimensions that don't exist in target format
+        
+        # Copy existing extra dimensions from original file
+        orig_extra_dims = {dim.name for dim in input_las.point_format.extra_dimensions}
+        output_extra_dims = {dim.name for dim in output_las.point_format.extra_dimensions}
+        
+        for dim_name in orig_extra_dims:
+            if dim_name not in ['PredInstance', 'species_id']:  # We'll add these fresh
+                try:
+                    # Check if dimension already exists in output
+                    if dim_name not in output_extra_dims:
+                        dim_info = next(d for d in input_las.point_format.extra_dimensions if d.name == dim_name)
+                        output_las.add_extra_dim(
+                            laspy.ExtraBytesParams(name=dim_name, type=dim_info.dtype)
+                        )
+                        output_extra_dims.add(dim_name)  # Track that we added it
+                    setattr(output_las, dim_name, getattr(input_las, dim_name))
+                except Exception:
+                    pass  # Skip dimensions that can't be copied
+        
+        # Add PredInstance dimension (check if it already exists)
+        if "PredInstance" not in output_extra_dims:
+            output_las.add_extra_dim(
                 laspy.ExtraBytesParams(name="PredInstance", type=np.int32)
             )
-        input_las.PredInstance = new_instances
+        output_las.PredInstance = new_instances
 
-        # Only add species_id if it was present in all input files
+        # Only add species_id if it was present in all input files (check if it already exists)
         if all_have_species_id:
-            if "species_id" not in extra_dims:
-                input_las.add_extra_dim(
+            if "species_id" not in output_extra_dims:
+                output_las.add_extra_dim(
                     laspy.ExtraBytesParams(name="species_id", type=np.int32)
                 )
-            input_las.species_id = new_species
+            output_las.species_id = new_species
 
-        # Save to output directory
+        # Save to output directory (as regular LAZ, not COPC)
         output_file.parent.mkdir(parents=True, exist_ok=True)
-        input_las.write(
+        output_las.write(
             str(output_file),
             do_compress=True,
             laz_backend=laspy.LazBackend.LazrsParallel,
         )
+        
+        # Clean up
+        del input_las
+        del output_las
 
         return (input_file.name, matched_count, n_input_points, unique_instances, True, "Success")
 
@@ -1821,11 +1919,13 @@ def remap_to_original_input_files(
     spatial_buffer = max(tolerance * 2, 1.0)
 
     # Filter out already-processed files
+    # Note: Change .copc.laz to .laz since laspy cannot write COPC format
     files_to_process = []
     for input_file in original_files:
-        output_file = output_dir / input_file.name
+        output_name = input_file.name.replace('.copc.laz', '.laz')
+        output_file = output_dir / output_name
         if output_file.exists():
-            print(f"  Skipping {input_file.name} (output already exists)", flush=True)
+            print(f"  Skipping {output_name} (output already exists)", flush=True)
         else:
             files_to_process.append((input_file, output_file))
     
@@ -1895,6 +1995,7 @@ def merge_tiles(
     max_centroid_distance: float = 3.0,
     correspondence_tolerance: float = 0.05,
     max_volume_for_merge: float = 4.0,
+    border_zone_width: float = 10.0,
     min_cluster_size: int = 300,
     num_threads: int = 8,
     enable_matching: bool = True,
@@ -1914,13 +2015,10 @@ def merge_tiles(
     print(f"Output merged: {output_merged}" + (" (SKIPPED)" if skip_merged_file else ""))
     print(f"Output tiles: {output_tiles_dir}")
     print(f"Buffer: {buffer}m")
+    print(f"Workers: {num_threads}")
     print(f"Instance matching: {'ENABLED' if enable_matching else 'DISABLED'}")
     if enable_matching:
-        if require_overlap:
-            print(f"  Overlap threshold: {overlap_threshold}")
-        else:
-            print(f"  Overlap check: DISABLED (centroid distance only)")
-            print(f"  Max centroid distance: {max_centroid_distance}m")
+        print(f"  Overlap threshold: {overlap_threshold}")
         print(f"Small cluster reassignment: ENABLED")
     print(f"  Min cluster size: {min_cluster_size} points")
     print(f"Volume merge: {'ENABLED' if enable_volume_merge else 'DISABLED'}")
@@ -1997,7 +2095,7 @@ def merge_tiles(
     print(f"\n{'=' * 60}")
     print("Stage 1: Loading tiles and filtering buffer zone instances")
     print(f"{'=' * 60}")
-    print(f"  Loading {len(laz_files)} files using {num_threads} processes...")
+    print(f"  Loading {len(laz_files)} files using {num_threads} workers (--workers={num_threads})...")
 
     tiles = []
     filtered_instances_per_tile = {}
@@ -2168,16 +2266,16 @@ def merge_tiles(
         return separation <= tolerance
 
     # =========================================================================
-    # Stage 2.5: Border Region Instance Matching
+    # Stage 3: Border Region Instance Matching
     # =========================================================================
     # Note: Cross-tile matching is optimized - each tile pair is checked exactly once
     # using `for j in range(i + 1, len(tiles))`, avoiding duplicate A->B and B->A checks.
     print(f"\n{'=' * 60}")
-    print("Stage 2.5: Border Region Instance Matching")
+    print("Stage 3: Border Region Instance Matching")
     print(f"{'=' * 60}")
-    print(f"  Finding border region instances (centroids in buffer to buffer+10m zone)...")
+    print(f"  Finding border region instances (centroids in buffer to buffer+{border_zone_width}m zone)...")
     
-    # Find border region instances (centroids in buffer to buffer+10m zone)
+    # Find border region instances (centroids in buffer to buffer+border_zone_width zone)
     border_instances = {}  # tile_name -> {instance_id: {'centroid': [...], 'points': [...], 'boundary': [...]}}
     
     # Build tile name to index mapping
@@ -2195,16 +2293,16 @@ def merge_tiles(
         min_dimension = min(tile_width, tile_height)
         actual_buffer = min(buffer, min_dimension * 0.4)
         actual_buffer = max(actual_buffer, 2.0)
-        border_zone_end = actual_buffer + 10.0  # 10m beyond buffer
+        border_zone_end = actual_buffer + border_zone_width  # border_zone_width beyond buffer
         
-        # Define border region boundaries (buffer to buffer+10m from edges with neighbors)
+        # Define border region boundaries (buffer to buffer+border_zone_width from edges with neighbors)
         # Inner edge of border region (end of buffer zone)
         border_inner_min_x = min_x + (actual_buffer if neighbors["west"] is not None else 0)
         border_inner_max_x = max_x - (actual_buffer if neighbors["east"] is not None else 0)
         border_inner_min_y = min_y + (actual_buffer if neighbors["south"] is not None else 0)
         border_inner_max_y = max_y - (actual_buffer if neighbors["north"] is not None else 0)
         
-        # Outer edge of border region (buffer+10m from tile edge)
+        # Outer edge of border region (buffer+border_zone_width from tile edge)
         border_outer_min_x = min_x + (border_zone_end if neighbors["west"] is not None else 0)
         border_outer_max_x = max_x - (border_zone_end if neighbors["east"] is not None else 0)
         border_outer_min_y = min_y + (border_zone_end if neighbors["south"] is not None else 0)
@@ -2212,9 +2310,9 @@ def merge_tiles(
         
         border_instances[tile_name] = {}
         
-        # OPTIMIZATION: Filter points to donut-shaped border region FIRST
+        # OPTIMIZATION: Filter points to border region FIRST
         # This dramatically reduces the number of centroids we need to compute
-        print(f"      Filtering points to border region (donut)...")
+        print(f"      Filtering points to border region...")
         border_mask = get_border_region_mask(
             tile.points, tile.boundary, actual_buffer, border_zone_end, neighbors
         )
@@ -2231,9 +2329,15 @@ def merge_tiles(
             print(f"      No border region instances in {tile.name}")
             continue
         
-        # Compute centroids ONLY for instances in border region
-        print(f"      Computing centroids for {len(border_unique_insts)} border instances (vs {len(kept_instances)} total)...")
-        border_centroids = compute_centroids_vectorized(border_points, border_inst_ids)
+        # Compute centroids from FULL tile points (not just border region)
+        # This ensures centroid represents the full tree, not just border portion
+        print(f"      Computing centroids for {len(border_unique_insts)} border instances (from full tile points)...")
+        all_centroids = compute_centroids_vectorized(tile.points, tile.instances)
+        border_centroids = {
+            inst_id: all_centroids[inst_id]
+            for inst_id in border_unique_insts
+            if inst_id in all_centroids
+        }
         
         border_count = 0
         
@@ -2291,7 +2395,6 @@ def merge_tiles(
     
     border_matches = 0
     total_bbox_checks = 0
-    total_centroid_checks = 0
     total_ff3d_computations = 0
     tiles_processed = 0
     
@@ -2328,27 +2431,17 @@ def merge_tiles(
             print(f"    Checking {tile_a.name} ({direction}) <-> {tile_b.name} ({get_opposite_direction(direction)}): "
                   f"{len(border_insts_a)} vs {len(border_insts_b)} border instances", end=" ... ")
             
-            # Build KDTree from tile B centroids for fast spatial lookup
-            # Only for instances not already matched
-            centroids_b_list = []
-            inst_ids_b_list = []
-            gids_b_list = []
-            
+            # Build list of candidate instances from tile B (not already matched)
+            candidates_b = []
             for inst_id_b, data_b in border_insts_b.items():
                 gid_b = global_id(tile_b_idx, inst_id_b)
-                # Skip if already matched (avoid redundant checks)
                 if gid_b not in matched_gids:
-                    centroids_b_list.append(data_b['centroid'])
-                    inst_ids_b_list.append(inst_id_b)
-                    gids_b_list.append(gid_b)
+                    candidates_b.append((inst_id_b, gid_b, data_b))
             
-            if not centroids_b_list:
+            if not candidates_b:
                 continue
             
-            centroids_b_array = np.array(centroids_b_list)
-            tree_b = cKDTree(centroids_b_array)
-            
-            # For each instance in tile A, find nearby instances in tile B using KDTree
+            # For each instance in tile A, check overlap with all candidate instances in tile B
             for inst_id_a, data_a in border_insts_a.items():
                 gid_a = global_id(i, inst_id_a)
                 
@@ -2356,41 +2449,14 @@ def merge_tiles(
                 if gid_a in matched_gids:
                     continue
                 
-                centroid_a = data_a['centroid']
                 bbox_a = data_a['boundary']
                 
-                # Query KDTree to find instances within max_centroid_distance
-                # This dramatically reduces the number of pairs to check
-                k = min(len(centroids_b_list), 10)
-                if k == 1:
-                    # Single result: query returns scalar
-                    distance, idx = tree_b.query(centroid_a, k=1, distance_upper_bound=max_centroid_distance)
-                    if np.isfinite(distance):
-                        candidate_indices = [idx]
-                        candidate_distances = [distance]
-                    else:
-                        candidate_indices = []
-                        candidate_distances = []
-                else:
-                    # Multiple results: query returns arrays
-                    distances, indices = tree_b.query(centroid_a, k=k, distance_upper_bound=max_centroid_distance)
-                    # Filter to valid results (within distance, not inf)
-                    valid_mask = np.isfinite(distances)
-                    candidate_indices = indices[valid_mask].tolist()
-                    candidate_distances = distances[valid_mask].tolist()
-                
-                total_centroid_checks += len(candidate_indices)
-                
-                # Check each candidate pair
-                for idx, dist in zip(candidate_indices, candidate_distances):
-                    inst_id_b = inst_ids_b_list[idx]
-                    gid_b = gids_b_list[idx]
-                    
+                # Check each candidate in tile B
+                for inst_id_b, gid_b, data_b in candidates_b:
                     # Skip if already matched
                     if gid_b in matched_gids:
                         continue
                     
-                    data_b = border_insts_b[inst_id_b]
                     bbox_b = data_b['boundary']
                     
                     # Quick bounding box overlap/nearby check (within 10cm tolerance)
@@ -2418,7 +2484,7 @@ def merge_tiles(
                         matched_gids.add(gid_b)
                         border_matches += 1
                         if verbose:
-                            print(f"      ✓ Match: {tile_a.name}:{inst_id_a} <-> {tile_b.name}:{inst_id_b} (overlap: {overlap_ratio:.3f}, dist: {dist:.2f}m)")
+                            print(f"      ✓ Match: {tile_a.name}:{inst_id_a} <-> {tile_b.name}:{inst_id_b} (overlap: {overlap_ratio:.3f})")
             
             # Progress: Show results for this tile pair
             matches_this_pair = border_matches - matches_before
@@ -2433,142 +2499,8 @@ def merge_tiles(
                 print(f"  Progress: {tiles_processed} tile pairs processed, {border_matches} total matches so far...")
     
     print(f"  Matched {border_matches} border region instance pairs")
-    print(f"  Performance: {total_bbox_checks} bbox checks, {total_centroid_checks} centroid checks, {total_ff3d_computations} FF3D computations")
-    print(f"  ✓ Stage 2.5 completed: Border region matching done")
-
-    # =========================================================================
-    # Stage 3: Cross-Tile Instance Matching (Optional)
-    # =========================================================================
-    if enable_matching:
-        print(f"\n{'=' * 60}")
-        print("Stage 3: Cross-Tile Instance Matching")
-        print(f"{'=' * 60}")
-
-        # Pre-compute kept masks for all tiles (cache to avoid recomputing per pair)
-        print("  Pre-computing kept instance masks...")
-        kept_masks = {}
-        for tile in tiles:
-            kept_set = kept_instances_per_tile[tile.name]
-            # Convert set to sorted array for faster np.isin
-            kept_array = np.array(sorted(kept_set), dtype=tile.instances.dtype)
-            kept_masks[tile.name] = np.isin(tile.instances, kept_array)
-
-        total_matches = 0
-
-        for i in range(len(tiles)):
-            for j in range(i + 1, len(tiles)):
-                tile_a = tiles[i]
-                tile_b = tiles[j]
-
-                # Check for overlap
-                overlap = find_overlap_region(tile_a.boundary, tile_b.boundary)
-                if overlap is None:
-                    continue
-
-                print(f"\n  Tile {tile_a.name} <-> {tile_b.name}")
-
-                # Use cached kept masks
-                kept_mask_a = kept_masks[tile_a.name]
-                kept_mask_b = kept_masks[tile_b.name]
-
-                points_a, inst_a, _ = get_points_in_region(
-                    tile_a.points[kept_mask_a], tile_a.instances[kept_mask_a], overlap
-                )
-                points_b, inst_b, _ = get_points_in_region(
-                    tile_b.points[kept_mask_b], tile_b.instances[kept_mask_b], overlap
-                )
-
-                if len(points_a) == 0 or len(points_b) == 0:
-                    continue
-
-                # Compute overlap ratios (vectorized)
-                computed_overlap_ratios, size_a, size_b = compute_ff3d_overlap_ratios(
-                    inst_a, inst_b, points_a, points_b, correspondence_tolerance
-                )
-
-                # Pre-compute centroids using vectorized function
-                centroids_a = compute_centroids_vectorized(points_a, inst_a)
-                centroids_b = compute_centroids_vectorized(points_b, inst_b)
-
-                # Find matching pairs above threshold AND within centroid distance
-                matches_in_pair = 0
-                rejected_low_overlap = 0
-                rejected_far_centroid = 0
-
-                for (
-                    inst_a_local,
-                    inst_b_local,
-                ), ratio in computed_overlap_ratios.items():
-                    # Compute centroid distance
-                    if inst_a_local in centroids_a and inst_b_local in centroids_b:
-                        centroid_dist = np.linalg.norm(
-                            centroids_a[inst_a_local] - centroids_b[inst_b_local]
-                        )
-                    else:
-                        centroid_dist = float("inf")
-
-                    # Check conditions (overlap is optional)
-                    passes_overlap = not require_overlap or (ratio >= overlap_threshold)
-                    passes_distance = centroid_dist < max_centroid_distance
-
-                    if verbose:
-                        status = (
-                            "MERGED"
-                            if (passes_overlap and passes_distance)
-                            else "REJECTED"
-                        )
-                        reason = ""
-                        if require_overlap and ratio < overlap_threshold:
-                            reason = f"low overlap ({ratio:.2f} < {overlap_threshold})"
-                        elif not passes_distance:
-                            reason = f"too far ({centroid_dist:.1f}m > {max_centroid_distance}m)"
-                        print(
-                            f"      Inst {inst_a_local} <-> {inst_b_local}: ratio={ratio:.2f}, dist={centroid_dist:.1f}m → {status} {reason}"
-                        )
-
-                    if passes_overlap and passes_distance:
-                        gid_a = global_id(i, inst_a_local)
-                        gid_b = global_id(j, inst_b_local)
-
-                        # Union with species from larger instance
-                        root = uf.union(gid_a, gid_b)
-
-                        # Keep species from larger instance
-                        size_gid_a = instance_sizes.get(gid_a, 0)
-                        size_gid_b = instance_sizes.get(gid_b, 0)
-                        if size_gid_a >= size_gid_b:
-                            winner_species = instance_species_map.get(gid_a, 0)
-                        else:
-                            winner_species = instance_species_map.get(gid_b, 0)
-                        instance_species_map[root] = winner_species
-
-                        matches_in_pair += 1
-                    elif passes_overlap and not passes_distance:
-                        rejected_far_centroid += 1
-                    elif require_overlap:
-                        rejected_low_overlap += 1
-
-                if matches_in_pair > 0 or verbose:
-                    if require_overlap:
-                        print(
-                            f"{matches_in_pair} pairs merged, {rejected_far_centroid} rejected (centroid too far), {rejected_low_overlap} rejected (low overlap)"
-                        )
-                    else:
-                        print(
-                            f"{matches_in_pair} pairs merged, {rejected_far_centroid} rejected (centroid too far)"
-                        )
-                total_matches += matches_in_pair
-
-        print(f"\n  Total matching pairs: {total_matches}")
-        print(f"  ✓ Stage 3 completed: Matched {total_matches} cross-tile instance pairs")
-    else:
-        print(f"\n{'=' * 60}")
-        print("Stage 3: Cross-Tile Instance Matching (DISABLED)")
-        print(f"{'=' * 60}")
-        print(
-            "  Skipping instance matching - instances will not be merged across tiles"
-        )
-        print(f"  ✓ Stage 3 skipped (disabled)")
+    print(f"  Performance: {total_bbox_checks} bbox checks, {total_ff3d_computations} FF3D computations")
+    print(f"  ✓ Stage 3 completed: Border region matching done")
 
     # Get connected components
     components = uf.get_components()
@@ -3240,6 +3172,13 @@ def main():
     )
 
     parser.add_argument(
+        "--border-zone-width",
+        type=float,
+        default=10.0,
+        help="Width of border zone beyond buffer for instance matching (default: 10.0m)",
+    )
+
+    parser.add_argument(
         "--workers",
         type=int,
         default=4,
@@ -3290,6 +3229,7 @@ def main():
         max_centroid_distance=args.max_centroid_distance,
         correspondence_tolerance=args.correspondence_tolerance,
         max_volume_for_merge=args.max_volume_for_merge,
+        border_zone_width=args.border_zone_width,
         num_threads=args.num_threads,
         enable_matching=not args.disable_matching,
         require_overlap=not args.disable_overlap_check,

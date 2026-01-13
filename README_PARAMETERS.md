@@ -63,16 +63,18 @@ Parameters are applied in this order (highest priority last):
 | CLI Argument | Default | Description |
 |--------------|---------|-------------|
 | `--subsampled-10cm-folder` | None | Path to segmented 10cm tiles |
-| `--original-input-dir` | None | Path to original input LAZ files for final remap (Stage 7) |
+| `--original-input-dir` | None | Path to original input LAZ files for final remap (Stage 6) |
 | `--target-resolution` | 2 | Target resolution in cm for remapping |
 | `--buffer` | 10.0 | Buffer distance for filtering in meters |
+| `--border-zone-width` | 10.0 | Width of border zone beyond buffer for instance matching (meters) |
 | `--overlap-threshold` | 0.3 | Overlap ratio for instance matching (0.3 = 30%) |
 | `--max-centroid-distance` | 3.0 | Max centroid distance to merge instances in meters |
 | `--correspondence-tolerance` | 0.05 | Point correspondence tolerance in meters |
 | `--max-volume-for-merge` | 4.0 | Max convex hull volume for small instance merge in m³ |
 | `--min-cluster-size` | 300 | Minimum cluster size in points |
-| `--disable-matching` | False | Disable cross-tile instance matching |
+| `--disable-matching` | False | Disable border region instance matching |
 | `--disable-volume-merge` | False | Disable small volume instance merging |
+| `--skip-merged-file` | False | Skip creating merged LAZ file (only create retiled outputs) |
 | `--verbose` | False | Print detailed merge decisions |
 
 ## Usage Examples
@@ -141,7 +143,7 @@ python src/run.py --task merge \
   --workers 8
 ```
 
-This runs all merge stages including Stage 7 (remapping predictions back to original input files).
+This runs all merge stages including Stage 6 (remapping predictions back to original input files).
 
 ## Testing Parameters
 
@@ -188,6 +190,7 @@ Environment variables use UPPER_SNAKE_CASE:
 | `RESOLUTION_1` | `--resolution-1` |
 | `RESOLUTION_2` | `--resolution-2` |
 | `BUFFER` | `--buffer` |
+| `BORDER_ZONE_WIDTH` | `--border-zone-width` |
 | `OVERLAP_THRESHOLD` | `--overlap-threshold` |
 | `ORIGINAL_INPUT_DIR` | `--original-input-dir` |
 
@@ -204,4 +207,4 @@ Environment variables use UPPER_SNAKE_CASE:
 
 **Tile Task:** `--tile-length`, `--tile-buffer`, `--grid-offset`, `--threads`, `--resolution-1`, `--resolution-2`, `--skip-dimension-reduction`, `--num-spatial-chunks`
 
-**Merge Task:** `--subsampled-10cm-folder`, `--original-input-dir`, `--target-resolution`, `--buffer`, `--overlap-threshold`, `--max-centroid-distance`, `--correspondence-tolerance`, `--max-volume-for-merge`, `--min-cluster-size`, `--disable-matching`, `--disable-volume-merge`, `--verbose`
+**Merge Task:** `--subsampled-10cm-folder`, `--original-input-dir`, `--target-resolution`, `--buffer`, `--border-zone-width`, `--overlap-threshold`, `--max-centroid-distance`, `--correspondence-tolerance`, `--max-volume-for-merge`, `--min-cluster-size`, `--disable-matching`, `--disable-volume-merge`, `--skip-merged-file`, `--verbose`

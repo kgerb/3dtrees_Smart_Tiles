@@ -197,6 +197,12 @@ class Parameters(BaseSettings):
         validation_alias=AliasChoices("max-volume-for-merge", "max_volume_for_merge"),
     )
     
+    border_zone_width: Optional[float] = Field(
+        10.0,
+        description="Width of border zone beyond buffer for instance matching (meters)",
+        validation_alias=AliasChoices("border-zone-width", "border_zone_width"),
+    )
+    
     min_cluster_size: Optional[int] = Field(
         300,
         description="Minimum cluster size in points for reassignment",
@@ -213,6 +219,12 @@ class Parameters(BaseSettings):
         False,
         description="Disable small volume instance merging",
         validation_alias=AliasChoices("disable-volume-merge", "disable_volume_merge"),
+    )
+    
+    skip_merged_file: bool = Field(
+        False,
+        description="Skip creating merged LAZ file (only create retiled outputs)",
+        validation_alias=AliasChoices("skip-merged-file", "skip_merged_file"),
     )
     
     verbose: bool = Field(

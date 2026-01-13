@@ -165,6 +165,7 @@ def run_merge_task(params: Parameters):
     max_centroid_distance = params.max_centroid_distance
     correspondence_tolerance = params.correspondence_tolerance
     max_volume_for_merge = params.max_volume_for_merge
+    border_zone_width = params.border_zone_width
     min_cluster_size = params.min_cluster_size
     
     print("=" * 60)
@@ -256,11 +257,13 @@ def run_merge_task(params: Parameters):
             max_centroid_distance=max_centroid_distance,
             correspondence_tolerance=correspondence_tolerance,
             max_volume_for_merge=max_volume_for_merge,
+            border_zone_width=border_zone_width,
             min_cluster_size=min_cluster_size,
             num_threads=workers,
             enable_matching=not params.disable_matching,
             require_overlap=True,
             enable_volume_merge=not params.disable_volume_merge,
+            skip_merged_file=params.skip_merged_file,
             verbose=params.verbose,
         )
         
@@ -287,6 +290,7 @@ def preprocess_boolean_flags(args_list):
         '--skip-dimension-reduction', '--skip_dimension_reduction',
         '--disable-matching', '--disable_matching',
         '--disable-volume-merge', '--disable_volume_merge',
+        '--skip-merged-file', '--skip_merged_file',
         '--verbose', '-v'
     ]
     
