@@ -232,6 +232,18 @@ class Parameters(BaseSettings):
         description="Print detailed merge decisions",
     )
     
+    retile_buffer: Optional[float] = Field(
+        1.0,
+        description="Spatial buffer expansion in meters for filtering merged points during retiling",
+        validation_alias=AliasChoices("retile-buffer", "retile_buffer"),
+    )
+    
+    retile_max_radius: Optional[float] = Field(
+        0.1,
+        description="Maximum distance threshold in meters for cKDTree nearest neighbor matching during retiling",
+        validation_alias=AliasChoices("retile-max-radius", "retile_max_radius"),
+    )
+    
     # ==========================================================================
     # Validators
     # ==========================================================================
@@ -267,6 +279,8 @@ class Parameters(BaseSettings):
         "max_centroid_distance",
         "correspondence_tolerance",
         "max_volume_for_merge",
+        "retile_buffer",
+        "retile_max_radius",
     )
     @classmethod
     def validate_merge_params(cls, v, info):
@@ -337,6 +351,8 @@ def print_params(params: Parameters):
     print(f"  min_cluster_size: {params.min_cluster_size}")
     print(f"  disable_matching: {params.disable_matching}")
     print(f"  verbose: {params.verbose}")
+    print(f"  retile_buffer: {params.retile_buffer}")
+    print(f"  retile_max_radius: {params.retile_max_radius}")
     
     print("=" * 60)
 
@@ -367,6 +383,8 @@ def get_merge_params(params: Parameters) -> dict:
         'min_cluster_size': params.min_cluster_size,
         'workers': params.workers,
         'verbose': params.verbose,
+        'retile_buffer': params.retile_buffer,
+        'retile_max_radius': params.retile_max_radius,
     }
 
 
@@ -404,6 +422,8 @@ MERGE_PARAMS = {
     'min_cluster_size': 300,
     'workers': 4,
     'verbose': True,
+    'retile_buffer': 1.0,
+    'retile_max_radius': 2.0,
 }
 
 

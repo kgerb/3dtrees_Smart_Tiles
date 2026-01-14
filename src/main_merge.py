@@ -63,6 +63,8 @@ def run_merge(
     enable_volume_merge: bool = True,
     skip_merged_file: bool = False,
     verbose: bool = True,
+    retile_buffer: float = 1.0,
+    retile_max_radius: float = 0.1,
 ) -> Path:
     """
     Run the tile merge pipeline.
@@ -84,6 +86,8 @@ def run_merge(
         enable_volume_merge: Enable small volume instance merging
         skip_merged_file: Skip creating merged LAZ file (only retile)
         verbose: Print detailed merge decisions
+        retile_buffer: Spatial buffer expansion in meters for filtering merged points during retiling
+        retile_max_radius: Maximum distance threshold in meters for cKDTree nearest neighbor matching during retiling
     
     Returns:
         Path to merged output file
@@ -149,6 +153,8 @@ def run_merge(
         enable_volume_merge=enable_volume_merge,
         skip_merged_file=skip_merged_file,
         verbose=verbose,
+        retile_buffer=retile_buffer,
+        retile_max_radius=retile_max_radius,
     )
     
     return output_merged

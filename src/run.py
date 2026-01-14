@@ -167,6 +167,8 @@ def run_merge_task(params: Parameters):
     max_volume_for_merge = params.max_volume_for_merge
     border_zone_width = params.border_zone_width
     min_cluster_size = params.min_cluster_size
+    retile_buffer = params.retile_buffer
+    retile_max_radius = params.retile_max_radius
     
     print("=" * 60)
     print("Running Merge Task (Python Pipeline)")
@@ -265,6 +267,8 @@ def run_merge_task(params: Parameters):
             enable_volume_merge=not params.disable_volume_merge,
             skip_merged_file=params.skip_merged_file,
             verbose=params.verbose,
+            retile_buffer=retile_buffer,
+            retile_max_radius=retile_max_radius,
         )
         
         print()
