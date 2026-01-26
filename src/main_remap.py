@@ -23,8 +23,6 @@ import numpy as np
 import laspy
 from scipy.spatial import cKDTree  
 
-from parameters import REMAP_PARAMS
-
 
 def get_file_bounds(filepath: Path) -> Optional[Tuple[float, float, float, float]]:
     """

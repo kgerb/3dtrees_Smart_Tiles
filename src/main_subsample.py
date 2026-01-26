@@ -30,15 +30,7 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 # Import parameters
-try:
-    from parameters import TILE_PARAMS
-except ImportError:
-    TILE_PARAMS = {
-        'resolution_1': 0.02,  # 2cm
-        'resolution_2': 0.1,   # 10cm
-        'workers': 4,
-        'threads': 5,  # Number of spatial chunks per file for parallel subsampling
-    }
+from parameters import TILE_PARAMS
 
 
 def get_pdal_path() -> str:

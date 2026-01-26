@@ -26,16 +26,8 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 import plot_tiles_and_copc
 
-# Import parameters
-try:
-    from parameters import TILE_PARAMS
-except ImportError:
-    TILE_PARAMS = {
-        'tile_length': 100,
-        'tile_buffer': 5,
-        'threads': 5,
-        'workers': 4,
-    }
+from parameters import TILE_PARAMS
+
 
 
 def get_pdal_path() -> str:
