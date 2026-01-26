@@ -35,7 +35,6 @@ except ImportError:
         'tile_buffer': 5,
         'threads': 5,
         'workers': 4,
-        'grid_offset': 1.0,
     }
 
 
@@ -401,8 +400,8 @@ def calculate_tile_bounds(
     tindex_file: Path,
     tile_length: float,
     tile_buffer: float,
-    grid_offset: float,
-    output_dir: Path
+    output_dir: Path,
+    grid_offset: float = 1.0
 ) -> Tuple[Path, Path, dict]:
     """
     Calculate tile bounds from tindex.
@@ -444,7 +443,6 @@ def calculate_tile_bounds(
     
     print(f"  Tile length: {tile_length}m")
     print(f"  Tile buffer: {tile_buffer}m")
-    print(f"  Grid offset: {grid_offset}m")
     
     result = subprocess.run(cmd, capture_output=True, text=True, check=False)
     
@@ -784,7 +782,7 @@ def run_tiling_pipeline(
     
     # Step 3: Calculate tile bounds
     jobs_file, bounds_json, env = calculate_tile_bounds(
-        tindex_file, tile_length, tile_buffer, grid_offset, output_dir
+        tindex_file, tile_length, tile_buffer, output_dir, grid_offset
     )
 
     # Step 4: Plot the tiles
@@ -840,14 +838,7 @@ def main():
         default=TILE_PARAMS.get('tile_buffer', 5),
         help=f"Buffer overlap in meters (default: {TILE_PARAMS.get('tile_buffer', 5)})"
     )
-    
-    parser.add_argument(
-        "--grid_offset",
-        type=float,
-        default=TILE_PARAMS.get('grid_offset', 1.0),
-        help=f"Grid offset in meters (default: {TILE_PARAMS.get('grid_offset', 1.0)})"
-    )
-    
+
     parser.add_argument(
         "--num_workers",
         type=int,
@@ -883,7 +874,6 @@ def main():
             output_dir=args.output_dir,
             tile_length=args.tile_length,
             tile_buffer=args.tile_buffer,
-            grid_offset=args.grid_offset,
             num_workers=args.num_workers,
             threads=args.threads,
             max_tile_procs=args.max_tile_procs

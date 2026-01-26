@@ -75,7 +75,6 @@ def run_tile_task(params: Parameters):
     tile_buffer = params.tile_buffer
     threads = params.threads
     workers = params.workers
-    grid_offset = params.grid_offset
     skip_dimension_reduction = params.skip_dimension_reduction
     num_spatial_chunks = params.num_spatial_chunks
     res1 = params.resolution_1
@@ -89,7 +88,6 @@ def run_tile_task(params: Parameters):
     print(f"Output directory: {output_dir}")
     print(f"Tile length: {tile_length}m")
     print(f"Tile buffer: {tile_buffer}m")
-    print(f"Grid offset: {grid_offset}m")
     print(f"Workers: {workers}")
     print(f"Threads per writer: {threads}")
     print(f"Skip dimension reduction: {skip_dimension_reduction}")
@@ -107,7 +105,6 @@ def run_tile_task(params: Parameters):
             output_dir=output_dir,
             tile_length=tile_length,
             tile_buffer=tile_buffer,
-            grid_offset=grid_offset,
             num_workers=workers,
             threads=threads,
             max_tile_procs=workers,

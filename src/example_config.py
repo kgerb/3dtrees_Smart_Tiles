@@ -13,7 +13,6 @@ TILE_PARAMS = {
     'workers': 8,                 # More parallel workers
     'resolution_1': 0.01,         # Finer resolution 1 (1cm instead of 2cm)
     'resolution_2': 0.05,         # Resolution 2 (5cm instead of 10cm)
-    'grid_offset': 1.0,           # Grid offset (standard)
 }
 
 # Remap task parameters - for higher precision

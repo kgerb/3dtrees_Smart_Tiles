@@ -62,13 +62,13 @@ class Parameters(BaseSettings):
     # ==========================================================================
     
     tile_length: Optional[int] = Field(
-        100,
+        300,
         description="Tile size in meters (only for 'tile' task)",
         validation_alias=AliasChoices("tile-length", "tile_length"),
     )
     
     tile_buffer: Optional[int] = Field(
-        5,
+        20,
         description="Buffer overlap in meters (only for 'tile' task)",
         validation_alias=AliasChoices("tile-buffer", "tile_buffer"),
     )
@@ -79,8 +79,8 @@ class Parameters(BaseSettings):
     )
     
     resolution_1: Optional[float] = Field(
-        0.02,
-        description="First subsampling resolution in meters (2cm) (only for 'tile' task)",
+        0.01,
+        description="First subsampling resolution in meters (1cm) (only for 'tile' task)",
         validation_alias=AliasChoices("resolution-1", "resolution_1"),
     )
     
@@ -90,11 +90,6 @@ class Parameters(BaseSettings):
         validation_alias=AliasChoices("resolution-2", "resolution_2"),
     )
     
-    grid_offset: Optional[float] = Field(
-        1.0,
-        description="Grid offset from min coordinates in meters (only for 'tile' task)",
-        validation_alias=AliasChoices("grid-offset", "grid_offset"),
-    )
     
     skip_dimension_reduction: bool = Field(
         True,
@@ -301,7 +296,6 @@ class Parameters(BaseSettings):
         "correspondence_tolerance",
         "max_volume_for_merge",
         "retile_buffer",
-        "retile_max_radius",
     )
     @classmethod
     def validate_merge_params(cls, v, info):
@@ -357,7 +351,6 @@ def print_params(params: Parameters):
     print(f"  threads: {params.threads}")
     print(f"  resolution_1: {params.resolution_1}")
     print(f"  resolution_2: {params.resolution_2}")
-    print(f"  grid_offset: {params.grid_offset}")
     print(f"  skip_dimension_reduction: {params.skip_dimension_reduction}")
     
     print("\nMerge Task:")
@@ -373,7 +366,6 @@ def print_params(params: Parameters):
     print(f"  disable_matching: {params.disable_matching}")
     print(f"  verbose: {params.verbose}")
     print(f"  retile_buffer: {params.retile_buffer}")
-    print(f"  retile_max_radius: {params.retile_max_radius}")
     
     print("=" * 60)
 
@@ -388,7 +380,6 @@ def get_tile_params(params: Parameters) -> dict:
         'workers': params.workers,
         'resolution_1': params.resolution_1,
         'resolution_2': params.resolution_2,
-        'grid_offset': params.grid_offset,
         'skip_dimension_reduction': params.skip_dimension_reduction,
     }
 
@@ -424,7 +415,6 @@ TILE_PARAMS = {
     'workers': 4,
     'resolution_1': 0.02,
     'resolution_2': 0.1,
-    'grid_offset': 1.0,
     'skip_dimension_reduction': False,
 }
 
