@@ -63,6 +63,73 @@ def get_untwine_path() -> str:
     return untwine_path if untwine_path else "untwine"
 
 
+def _laspy_laz_backend():
+    """Return the LAZ backend to use for laspy (Lazrs or LazrsParallel when available)."""
+    try:
+        import laspy
+        if hasattr(laspy.LazBackend, "LazrsParallel"):
+            return laspy.LazBackend.LazrsParallel
+        if hasattr(laspy.LazBackend, "Lazrs"):
+            return laspy.LazBackend.Lazrs
+    except Exception:
+        pass
+    return None
+
+
+def check_and_fix_crs(laz_file: Path, default_crs: str = "EPSG:32630") -> Tuple[bool, str]:
+    """
+    Check if LAZ/LAS file has a CRS, and set it to default_crs if missing.
+
+    Uses laspy with an explicit LAZ backend (LazrsParallel or Lazrs) so compressed
+    files are read correctly. Requires the lazrs package to be installed.
+
+    Args:
+        laz_file: Path to LAZ/LAS file
+        default_crs: Default CRS to use if none is found (default: EPSG:32630 - WGS 84 / UTM zone 30N)
+
+    Returns:
+        Tuple of (had_crs, message)
+    """
+    try:
+        import laspy
+        from pyproj import CRS
+
+        laz_backend = _laspy_laz_backend()
+        kwargs = {}
+        if laz_file.suffix.lower() == ".laz" and laz_backend is not None:
+            kwargs["laz_backend"] = laz_backend
+
+        # Read the file (with explicit LAZ backend for .laz)
+        las = laspy.read(str(laz_file), **kwargs)
+
+        # Check if CRS exists
+        has_crs = False
+        existing_crs_str = "Unknown"
+        try:
+            existing_crs = las.header.parse_crs()
+            if existing_crs is not None:
+                wkt = (existing_crs.to_wkt() or "").strip()
+                if wkt and wkt.upper() not in ("", "UNKNOWN", "LOCAL_CS[]"):
+                    has_crs = True
+                    existing_crs_str = str(existing_crs)
+        except Exception:
+            has_crs = False
+
+        if not has_crs:
+            crs = CRS.from_string(default_crs)
+            las.add_crs(crs, replace=True)
+            do_compress = laz_file.suffix.lower() == ".laz"
+            write_kw = {"do_compress": do_compress}
+            if do_compress and laz_backend is not None:
+                write_kw["laz_backend"] = laz_backend
+            las.write(str(laz_file), **write_kw)
+            return (False, f"No CRS found, set to {default_crs}")
+        return (True, f"CRS already set: {existing_crs_str}")
+
+    except Exception as e:
+        return (False, f"Could not check/set CRS: {e}")
+
+
 def convert_single_file(args: Tuple[Path, Path, Path, bool, Optional[str]]) -> Tuple[str, bool, str]:
     """
     Convert a single LAZ file to COPC using untwine.
@@ -186,7 +253,7 @@ def convert_to_xyz_copc(
     input_files = list(input_dir.glob("*.laz")) + list(input_dir.glob("*.las"))
     # Exclude already converted COPC files
     input_files = [f for f in input_files if not f.name.endswith('.copc.laz')]
-    
+
     if not input_files:
         print(f"  No LAZ/LAS files found in {input_dir}")
         # Check if COPC files already exist
@@ -195,10 +262,25 @@ def convert_to_xyz_copc(
             print(f"  Found {len(existing_copc)} existing COPC files")
             return existing_copc
         return []
-    
+
     print(f"  Found {len(input_files)} files to convert")
     print(f"  Using {num_workers} parallel workers")
     print(f"  Output: {output_dir}")
+    print()
+
+    # Check and fix CRS for all input files
+    print("  Checking CRS for all input files...")
+    files_without_crs = []
+    for input_file in input_files:
+        had_crs, message = check_and_fix_crs(input_file)
+        if not had_crs:
+            files_without_crs.append(input_file.name)
+            print(f"  ⚠ Warning: {input_file.name} - {message}")
+
+    if files_without_crs:
+        print(f"  ⚠ Warning: {len(files_without_crs)} file(s) had no CRS, defaulted to EPSG:32630")
+    else:
+        print(f"  ✓ All files have CRS defined")
     print()
     
     # Prepare conversion tasks
@@ -633,17 +715,20 @@ def run_tiling_pipeline(
     num_workers: int = 4,
     threads: int = 5,
     max_tile_procs: int = 5,
-    dimension_reduction: bool = True
+    dimension_reduction: bool = True,
+    tiling_threshold: float = None
 ) -> Path:
     """
     Run the complete tiling pipeline.
-    
+
     Steps:
     1. Convert LAZ to COPC (with or without dimension reduction using untwine --dims)
     2. Build spatial index
     3. Calculate tile bounds
     4. Create overlapping tiles
-    
+
+    If input folder contains a single file below tiling_threshold, skips steps 2-4.
+
     Args:
         input_dir: Directory containing input LAZ files
         output_dir: Base output directory
@@ -654,9 +739,10 @@ def run_tiling_pipeline(
         threads: Threads per COPC writer
         max_tile_procs: Maximum parallel tile processes
         dimension_reduction: Enable XYZ-only reduction using untwine --dims (default: True)
-    
+        tiling_threshold: File size threshold in MB. If single file below this size, skip tiling
+
     Returns:
-        Path to tiles directory
+        Path to tiles directory (or COPC directory if tiling was skipped)
     """
     print("=" * 60)
     print("3DTrees Tiling Pipeline")
@@ -674,10 +760,25 @@ def run_tiling_pipeline(
     
     # Step 1: Convert to COPC (untwine handles dimension reduction with --dims if enabled)
     copc_files = convert_to_xyz_copc(input_dir, copc_dir, num_workers, log_dir, dimension_reduction)
-    
+
     if not copc_files:
         raise ValueError("No COPC files created or found")
-    
+
+    # Check if we should skip tiling (single small file)
+    if tiling_threshold is not None and len(copc_files) == 1:
+        file_size_mb = copc_files[0].stat().st_size / (1024 * 1024)
+        if file_size_mb < tiling_threshold:
+            print()
+            print("=" * 60)
+            print("Skipping Tiling (Single Small File)")
+            print("=" * 60)
+            print(f"  Single file detected: {copc_files[0].name}")
+            print(f"  File size: {file_size_mb:.2f} MB")
+            print(f"  Threshold: {tiling_threshold} MB")
+            print(f"  Returning COPC directory for direct subsampling")
+            print("=" * 60)
+            return copc_dir
+
     # Step 2: Build tindex
     tindex_file = build_tindex(copc_dir, tindex_file)
     

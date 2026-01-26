@@ -39,7 +39,22 @@ def run_get_bounds(tindex_path: Path, tile_length: float, tile_buffer: float, bo
     if grid_offset != 0.0:
         cmd.append(f"--grid-offset={grid_offset}")
     print(f"[prepare_tile_jobs] running: {' '.join(cmd)}", file=sys.stderr)
-    completed = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    completed = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    
+    if completed.returncode != 0:
+        # Print the full error message
+        if completed.stderr:
+            print(f"[prepare_tile_jobs] Error output:", file=sys.stderr)
+            print(completed.stderr, file=sys.stderr)
+        if completed.stdout:
+            print(f"[prepare_tile_jobs] Standard output:", file=sys.stderr)
+            print(completed.stdout, file=sys.stderr)
+        raise RuntimeError(
+            f"get_bounds_from_tindex.py failed with exit code {completed.returncode}.\n"
+            f"stderr: {completed.stderr}\n"
+            f"stdout: {completed.stdout}"
+        )
+    
     env = {}
     for line in completed.stdout.splitlines():
         if "=" in line:

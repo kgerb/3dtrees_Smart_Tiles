@@ -24,24 +24,9 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-# Import parameters
-try:
-    from parameters import MERGE_PARAMS
-except ImportError:
-    MERGE_PARAMS = {
-        'buffer': 10.0,
-        'overlap_threshold': 0.3,
-        'max_centroid_distance': 3.0,
-        'correspondence_tolerance': 0.05,
-        'max_volume_for_merge': 4.0,
-        'workers': 4,
-    }
-
-# Import the core merge function
-try:
-    from merge_tiles import merge_tiles as core_merge_tiles
-except ImportError:
-    core_merge_tiles = None
+# Import parameters and core merge function
+from parameters import MERGE_PARAMS
+from merge_tiles import merge_tiles as core_merge_tiles
 
 
 def run_merge(
@@ -127,12 +112,6 @@ def run_merge(
         print(f"Original input dir: {original_input_dir} (Stage 7 enabled)")
     print()
     
-    # Check if core merge function is available
-    if core_merge_tiles is None:
-        raise ImportError(
-            "merge_tiles.py not found. Make sure it's in the same directory."
-        )
-    
     # Run the core merge function
     core_merge_tiles(
         input_dir=segmented_dir,
@@ -142,14 +121,12 @@ def run_merge(
         original_input_dir=original_input_dir,
         buffer=buffer,
         overlap_threshold=overlap_threshold,
-        max_centroid_distance=max_centroid_distance,
         correspondence_tolerance=correspondence_tolerance,
         max_volume_for_merge=max_volume_for_merge,
         border_zone_width=border_zone_width,
         min_cluster_size=min_cluster_size,
         num_threads=num_threads,
         enable_matching=enable_matching,
-        require_overlap=require_overlap,
         enable_volume_merge=enable_volume_merge,
         skip_merged_file=skip_merged_file,
         verbose=verbose,
@@ -160,7 +137,7 @@ def run_merge(
     return output_merged
 
 
-def main():
+def main() -> None:
     """CLI entry point."""
     parser = argparse.ArgumentParser(
         description="3DTrees Merge Pipeline - Merge segmented tiles with instance matching",
@@ -168,9 +145,10 @@ def main():
     )
     
     parser.add_argument(
-        "--segmented_folder", "-i",
+        "--segmented_dir", "--segmented_folder", "-i",
         type=Path,
         required=True,
+        dest="segmented_dir",
         help="Directory containing segmented LAZ tiles"
     )
     
@@ -245,12 +223,34 @@ def main():
     )
     
     parser.add_argument(
-        "--workers",
+        "--num_threads", "--workers",
         type=int,
         default=MERGE_PARAMS.get('workers', 4),
+        dest="num_threads",
         help=f"Number of workers (default: {MERGE_PARAMS.get('workers', 4)})"
     )
-    
+
+    parser.add_argument(
+        "--border_zone_width",
+        type=float,
+        default=MERGE_PARAMS.get('border_zone_width', 10.0),
+        help=f"Width of border zone beyond buffer for instance matching (default: {MERGE_PARAMS.get('border_zone_width', 10.0)})"
+    )
+
+    parser.add_argument(
+        "--retile_buffer",
+        type=float,
+        default=MERGE_PARAMS.get('retile_buffer', 1.0),
+        help=f"Spatial buffer expansion in meters for retiling (default: {MERGE_PARAMS.get('retile_buffer', 1.0)})"
+    )
+
+    parser.add_argument(
+        "--retile_max_radius",
+        type=float,
+        default=MERGE_PARAMS.get('retile_max_radius', 0.1),
+        help=f"Max distance for nearest neighbor matching during retiling (default: {MERGE_PARAMS.get('retile_max_radius', 0.1)})"
+    )
+
     parser.add_argument(
         "--disable_matching",
         action="store_true",
@@ -286,7 +286,7 @@ def main():
     # Run pipeline
     try:
         output_file = run_merge(
-            segmented_dir=args.segmented_folder,
+            segmented_dir=args.segmented_dir,
             output_tiles_dir=args.output_tiles_dir,
             original_tiles_dir=args.original_tiles_dir,
             original_input_dir=args.original_input_dir,
@@ -297,12 +297,15 @@ def main():
             correspondence_tolerance=args.correspondence_tolerance,
             max_volume_for_merge=args.max_volume_for_merge,
             min_cluster_size=args.min_cluster_size,
-            num_threads=args.workers,
+            num_threads=args.num_threads,
             enable_matching=not args.disable_matching,
             require_overlap=not args.disable_overlap_check,
             enable_volume_merge=not args.disable_volume_merge,
             skip_merged_file=args.skip_merged_file,
             verbose=args.verbose,
+            border_zone_width=args.border_zone_width,
+            retile_buffer=args.retile_buffer,
+            retile_max_radius=args.retile_max_radius,
         )
         if not args.skip_merged_file:
             print(f"\nMerged output: {output_file}")
@@ -313,4 +316,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
