@@ -67,58 +67,41 @@ def _laspy_laz_backend():
     return None
 
 
-def check_and_fix_crs(laz_file: Path, default_crs: str = "EPSG:32630") -> Tuple[bool, str]:
+def check_crs(laz_file: Path) -> Tuple[bool, str]:
     """
-    Check if LAZ/LAS file has a CRS, and set it to default_crs if missing.
-
-    Uses laspy with an explicit LAZ backend (LazrsParallel or Lazrs) so compressed
-    files are read correctly. Requires the lazrs package to be installed.
-
+    Check if LAZ/LAS file has a CRS.
+    
     Args:
         laz_file: Path to LAZ/LAS file
-        default_crs: Default CRS to use if none is found (default: EPSG:32630 - WGS 84 / UTM zone 30N)
 
     Returns:
-        Tuple of (had_crs, message)
+        Tuple of (has_crs, crs_description)
     """
     try:
         import laspy
-        from pyproj import CRS
-
         laz_backend = _laspy_laz_backend()
         kwargs = {}
         if laz_file.suffix.lower() == ".laz" and laz_backend is not None:
             kwargs["laz_backend"] = laz_backend
 
-        # Read the file (with explicit LAZ backend for .laz)
-        las = laspy.read(str(laz_file), **kwargs)
-
-        # Check if CRS exists
-        has_crs = False
-        existing_crs_str = "Unknown"
-        try:
-            existing_crs = las.header.parse_crs()
-            if existing_crs is not None:
-                wkt = (existing_crs.to_wkt() or "").strip()
-                if wkt and wkt.upper() not in ("", "UNKNOWN", "LOCAL_CS[]"):
-                    has_crs = True
-                    existing_crs_str = str(existing_crs)
-        except Exception:
+        # Read only the header to be fast
+        with laspy.open(str(laz_file), **kwargs) as las:
+            # Check if CRS exists
             has_crs = False
-
-        if not has_crs:
-            crs = CRS.from_string(default_crs)
-            las.add_crs(crs, replace=True)
-            do_compress = laz_file.suffix.lower() == ".laz"
-            write_kw = {"do_compress": do_compress}
-            if do_compress and laz_backend is not None:
-                write_kw["laz_backend"] = laz_backend
-            las.write(str(laz_file), **write_kw)
-            return (False, f"No CRS found, set to {default_crs}")
-        return (True, f"CRS already set: {existing_crs_str}")
+            try:
+                crs = las.header.parse_crs()
+                if crs is not None:
+                    wkt = (crs.to_wkt() or "").strip()
+                    if wkt and wkt.upper() not in ("", "UNKNOWN", "LOCAL_CS[]"):
+                        has_crs = True
+                        return (True, str(crs))
+            except Exception:
+                pass
+            
+            return (False, "Missing")
 
     except Exception as e:
-        return (False, f"Could not check/set CRS: {e}")
+        return (False, f"Error checking: {e}")
 
 
 def convert_single_file(args: Tuple[Path, Path, Path, bool, Optional[str]]) -> Tuple[str, bool, str]:
@@ -189,16 +172,53 @@ def convert_single_file(args: Tuple[Path, Path, Path, bool, Optional[str]]) -> T
                 f.write(f"Stderr:\n{result.stderr}\n")
         
         if result.returncode != 0:
+            # CLEANUP: Remove potentially corrupt output file on failure
+            if output_file.exists():
+                try:
+                    output_file.unlink()
+                except Exception:
+                    pass
             return (display_name, False, result.stderr[:200])
         
         # Verify output exists and has content
         if not output_file.exists() or output_file.stat().st_size == 0:
+            if output_file.exists():
+                try:
+                    output_file.unlink()
+                except Exception:
+                    pass
             return (display_name, False, "Output file empty or not created")
         
         return (display_name, True, "Success")
         
     except Exception as e:
         return (display_name, False, str(e))
+
+
+def check_file_not_empty(laz_file: Path) -> Tuple[bool, int]:
+    """
+    Check if LAZ/LAS file has points.
+    
+    Args:
+        laz_file: Path to LAZ/LAS file
+
+    Returns:
+        Tuple of (is_not_empty, point_count)
+    """
+    try:
+        import laspy
+        laz_backend = _laspy_laz_backend()
+        kwargs = {}
+        if laz_file.suffix.lower() == ".laz" and laz_backend is not None:
+            kwargs["laz_backend"] = laz_backend
+
+        # Read only the header to be fast
+        with laspy.open(str(laz_file), **kwargs) as las:
+            count = las.header.point_count
+            return (count > 0, count)
+
+    except Exception:
+        return (False, 0)
 
 
 def convert_to_xyz_copc(
@@ -245,8 +265,40 @@ def convert_to_xyz_copc(
     # Exclude already converted COPC files
     input_files = [f for f in input_files if not f.name.endswith('.copc.laz')]
 
+    # Check CRS and emptiness for all input files
+    print("  Checking input files...")
+    files_without_crs = []
+    empty_files = []
+    valid_input_files = []
+    
+    for input_file in input_files:
+        # Check if empty
+        is_not_empty, count = check_file_not_empty(input_file)
+        if not is_not_empty:
+            empty_files.append(input_file.name)
+            continue
+            
+        valid_input_files.append(input_file)
+        
+        # Check CRS
+        has_crs, description = check_crs(input_file)
+        if not has_crs:
+            files_without_crs.append(input_file.name)
+
+    if empty_files:
+        print(f"  ⚠ Warning: {len(empty_files)} file(s) are empty (0 points) and will be skipped.")
+        if len(empty_files) <= 5:
+            print(f"    Empty: {', '.join(empty_files)}")
+            
+    if files_without_crs:
+        print(f"  Note: {len(files_without_crs)} file(s) have no CRS. Pipeline will treat coordinates as local metric units.")
+    elif valid_input_files:
+        print(f"  ✓ All valid files have CRS defined")
+    
+    input_files = valid_input_files
+
     if not input_files:
-        print(f"  No LAZ/LAS files found in {input_dir}")
+        print(f"  No valid (non-empty) LAZ/LAS files found in {input_dir}")
         # Check if COPC files already exist
         existing_copc = list(output_dir.glob("*.copc.laz"))
         if existing_copc:
@@ -254,24 +306,9 @@ def convert_to_xyz_copc(
             return existing_copc
         return []
 
-    print(f"  Found {len(input_files)} files to convert")
+    print(f"  Found {len(input_files)} valid files to convert")
     print(f"  Using {num_workers} parallel workers")
     print(f"  Output: {output_dir}")
-    print()
-
-    # Check and fix CRS for all input files
-    print("  Checking CRS for all input files...")
-    files_without_crs = []
-    for input_file in input_files:
-        had_crs, message = check_and_fix_crs(input_file)
-        if not had_crs:
-            files_without_crs.append(input_file.name)
-            print(f"  ⚠ Warning: {input_file.name} - {message}")
-
-    if files_without_crs:
-        print(f"  ⚠ Warning: {len(files_without_crs)} file(s) had no CRS, defaulted to EPSG:32630")
-    else:
-        print(f"  ✓ All files have CRS defined")
     print()
     
     # Prepare conversion tasks
