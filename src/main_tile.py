@@ -802,6 +802,27 @@ def run_tiling_pipeline(
     log_dir = output_dir / "logs"
     tindex_file = output_dir / f"tindex_{int(tile_length)}m.gpkg"
     
+    # Check if we should skip tiling based on original input file size
+    # This check happens BEFORE COPC conversion to use original file size
+    should_skip_tiling = False
+    if tiling_threshold is not None:
+        input_files = list(input_dir.glob("*.laz")) + list(input_dir.glob("*.las"))
+        input_files = [f for f in input_files if not f.name.endswith('.copc.laz')]
+        
+        if len(input_files) == 1:
+            original_size_mb = input_files[0].stat().st_size / (1024 * 1024)
+            if original_size_mb < tiling_threshold:
+                should_skip_tiling = True
+                print("=" * 60)
+                print("Tiling Threshold Check")
+                print("=" * 60)
+                print(f"  Single file detected: {input_files[0].name}")
+                print(f"  Original file size: {original_size_mb:.2f} MB")
+                print(f"  Threshold: {tiling_threshold} MB")
+                print(f"  Decision: Will skip tiling after COPC conversion")
+                print("=" * 60)
+                print()
+    
     # Step 1: Convert to COPC (untwine handles dimension reduction with --dims if enabled)
     copc_files = convert_to_xyz_copc(input_dir, copc_dir, num_workers, log_dir, dimension_reduction)
 
@@ -826,21 +847,17 @@ def run_tiling_pipeline(
     # Step 4: Plot the tiles
     plot_tiles_and_copc.plot_extents(tindex_file, bounds_json, output_dir/"overview_copc_tiles.png")
 
-    # Check if we should skip tiling (single small file)
+    # Check if we should skip tiling based on original input file size
     # We do this AFTER tindex/plotting so we still get the overview outputs
-    if tiling_threshold is not None and len(copc_files) == 1:
-        file_size_mb = copc_files[0].stat().st_size / (1024 * 1024)
-        if file_size_mb < tiling_threshold:
-            print()
-            print("=" * 60)
-            print("Skipping Tiling (Single Small File)")
-            print("=" * 60)
-            print(f"  Single file detected: {copc_files[0].name}")
-            print(f"  File size: {file_size_mb:.2f} MB")
-            print(f"  Threshold: {tiling_threshold} MB")
-            print(f"  Returning COPC directory for direct subsampling")
-            print("=" * 60)
-            return copc_dir
+    if should_skip_tiling:
+        print()
+        print("=" * 60)
+        print("Skipping Tiling (Single Small File)")
+        print("=" * 60)
+        print(f"  Threshold was based on original input file size")
+        print(f"  Returning COPC directory for direct subsampling")
+        print("=" * 60)
+        return copc_dir
     
     # Step 5: Create tiles
     tile_files = create_tiles(
