@@ -118,7 +118,9 @@ def subsample_tile_chunk(args: Tuple[Path, str, float, Path, int, int]) -> Tuple
                         "type": "writers.las",  # Always write as LAZ (compressed LAS)
                         "filename": str(chunk_file),
                         "compression": True,
-                        "extra_dims": "all"  # Preserve extra dimensions like PredInstance
+                        "extra_dims": "all",  # Preserve extra dimensions like PredInstance
+                        "minor_version": 2,
+                        "dataformat_id": 0
                     }
                 ]
             }
@@ -142,7 +144,9 @@ def subsample_tile_chunk(args: Tuple[Path, str, float, Path, int, int]) -> Tuple
                         "type": "writers.las",
                         "filename": str(chunk_file),
                         "compression": True,
-                        "extra_dims": "all"
+                        "extra_dims": "all",
+                        "minor_version": 2,
+                        "dataformat_id": 0
                     }
                 ]
             }
@@ -217,11 +221,18 @@ def subsample_single_file(args: Tuple[Path, Path, float, Path, int]) -> Tuple[st
         # Get file bounds
         bounds = get_file_bounds(input_file)
         if not bounds:
-            # Fall back to simple single-pass subsampling
+            # Fall back to simple single-pass subsampling when bounds cannot be determined
             return subsample_simple(input_file, output_file, resolution, pipeline_dir)
         
         minx, maxx, miny, maxy = bounds
-        
+
+        # If the file has zero extent in X (or Y), splitting into X-chunks
+        # with degenerate bounds (minx == maxx) can result in empty outputs
+        # from the COPC reader. In that case, fall back to the simple
+        # single-pass subsampling without spatial chunking.
+        if maxx - minx == 0 or maxy - miny == 0:
+            return subsample_simple(input_file, output_file, resolution, pipeline_dir)
+
         # Split into num_threads subtiles along X-axis only
         grid_x = num_threads
         grid_y = 1
@@ -282,7 +293,9 @@ def subsample_single_file(args: Tuple[Path, Path, float, Path, int]) -> Tuple[st
                     "type": "writers.las",  # Always write as LAZ (compressed LAS)
                     "filename": str(output_file),
                     "compression": True,
-                    "extra_dims": "all"  # Preserve extra dimensions like PredInstance
+                    "extra_dims": "all",  # Preserve extra dimensions like PredInstance
+                    "minor_version": 2,
+                    "dataformat_id": 0
                 }
             ]
         }
@@ -367,7 +380,9 @@ def subsample_simple(input_file: Path, output_file: Path, resolution: float, pip
                     "type": "writers.las",  # Always write as LAZ (compressed LAS)
                     "filename": str(output_file),
                     "compression": True,
-                    "extra_dims": "all"  # Preserve extra dimensions like PredInstance
+                    "extra_dims": "all",  # Preserve extra dimensions like PredInstance
+                    "minor_version": 2,
+                    "dataformat_id": 0
                 }
             ]
         }
@@ -589,7 +604,7 @@ def run_subsample_pipeline(
     
     # Get num_threads from TILE_PARAMS
     if num_threads is None:
-        num_threads = TILE_PARAMS.get('threads', 5)
+        num_threads = TILE_PARAMS.get('threads', 10)
     
     # Convert to cm for display/filenames (but use simple directory names)
     res1_cm = int(res1 * 100)

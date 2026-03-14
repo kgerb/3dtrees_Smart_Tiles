@@ -146,6 +146,15 @@ def run_tile_task(params: Parameters):
             output_prefix=output_prefix,
             output_base_dir=output_dir  # Output directly to output_dir, not under tiles_dir
         )
+
+        # Step 7: Update tile_bounds_tindex.json with actual bounds from created tiles
+        # (so remap/merge matching uses file extent instead of nominal grid)
+        bounds_json = output_dir / "tile_bounds_tindex.json"
+        if bounds_json.exists():
+            from main_tile import update_tile_bounds_json_from_files
+            num_updated = update_tile_bounds_json_from_files(bounds_json, res1_dir)
+            if num_updated > 0:
+                print(f"  Updated tile_bounds_tindex.json with bounds from {num_updated} tile(s) in {res1_dir.name}")
         
         print()
         print("=" * 60)
@@ -206,6 +215,22 @@ def run_remap_task(params: Parameters):
     else:
         output_folder = Path(output_folder)
 
+    # Optional: tile_bounds_tindex.json for grid-based matching (CLI takes precedence)
+    tile_bounds_json = None
+    if params.tile_bounds_json and Path(params.tile_bounds_json).exists():
+        tile_bounds_json = Path(params.tile_bounds_json)
+    if tile_bounds_json is None:
+        candidate_json_paths = [
+            source_folder / "tile_bounds_tindex.json",
+            source_folder.parent / "tile_bounds_tindex.json",
+            target_folder / "tile_bounds_tindex.json",
+            target_folder.parent / "tile_bounds_tindex.json",
+        ]
+        for p in candidate_json_paths:
+            if p.exists():
+                tile_bounds_json = p
+                break
+
     print("=" * 60)
     print("Running Remap Task")
     print("=" * 60)
@@ -219,7 +244,9 @@ def run_remap_task(params: Parameters):
         remapped_folder = remap_all_tiles(
             source_folder=source_folder,
             target_folder=target_folder,
-            output_folder=output_folder
+            output_folder=output_folder,
+            tile_bounds_json=tile_bounds_json,
+            verbose=bool(params.verbose),
         )
 
         print()
@@ -264,7 +291,6 @@ def run_merge_task(params: Parameters):
     buffer = params.buffer
     overlap_threshold = params.overlap_threshold
     max_centroid_distance = params.max_centroid_distance
-    correspondence_tolerance = params.correspondence_tolerance
     max_volume_for_merge = params.max_volume_for_merge
     border_zone_width = params.border_zone_width
     min_cluster_size = params.min_cluster_size
@@ -313,12 +339,30 @@ def run_merge_task(params: Parameters):
                     print(f"Path: {target_folder}")
                 print(f"Please provide --subsampled-target-folder")
                 sys.exit(1)
-            
+
+            # Optional: tile_bounds_tindex.json for remap matching (use --tile_bounds_json first)
+            remap_tile_bounds_json = None
+            if params.tile_bounds_json and params.tile_bounds_json.exists():
+                remap_tile_bounds_json = params.tile_bounds_json
+            if remap_tile_bounds_json is None:
+                remap_json_candidates = [
+                    parent_dir / "tile_bounds_tindex.json",
+                    subsampled_10cm_dir / "tile_bounds_tindex.json",
+                ]
+                if params.original_tiles_dir:
+                    remap_json_candidates.insert(0, Path(params.original_tiles_dir) / "tile_bounds_tindex.json")
+                for p in remap_json_candidates:
+                    if p.exists():
+                        remap_tile_bounds_json = p
+                        break
+
             # Remap - source is 10cm segmented, target is 2cm subsampled
             segmented_remapped_folder = remap_all_tiles(
                 source_folder=subsampled_10cm_dir,
                 target_folder=target_folder,
-                output_folder=output_folder
+                output_folder=output_folder,
+                tile_bounds_json=remap_tile_bounds_json,
+                verbose=bool(params.verbose),
             )
         
         # Step 2: Merge tiles
@@ -359,17 +403,28 @@ def run_merge_task(params: Parameters):
         if original_tiles_dir is None:
             # Try to find the tiles directory (parent of subsampled folders)
             original_tiles_dir = parent_dir
-        
+
+        # tile_bounds_json is required for merge (no fallback)
+        tile_bounds_json = params.tile_bounds_json
+        if tile_bounds_json is None:
+            raise ValueError(
+                "Merge task requires --tile_bounds_json /path/to/tile_bounds_tindex.json (e.g. from Tile task output)."
+            )
+        if not tile_bounds_json.exists():
+            raise FileNotFoundError(
+                f"tile_bounds_tindex.json not found: {tile_bounds_json}. Pass a valid --tile_bounds_json path."
+            )
+
         merged_output = run_merge(
             segmented_dir=segmented_remapped_folder,
             output_tiles_dir=output_tiles_dir,
             original_tiles_dir=original_tiles_dir,
+            tile_bounds_json=tile_bounds_json,
             original_input_dir=original_input_dir,
             output_merged=output_merged,
             buffer=buffer,
             overlap_threshold=overlap_threshold,
             max_centroid_distance=max_centroid_distance,
-            correspondence_tolerance=correspondence_tolerance,
             max_volume_for_merge=max_volume_for_merge,
             border_zone_width=border_zone_width,
             min_cluster_size=min_cluster_size,
@@ -380,6 +435,8 @@ def run_merge_task(params: Parameters):
             skip_merged_file=params.skip_merged_file,
             verbose=params.verbose,
             retile_buffer=retile_buffer,
+            instance_dimension=params.instance_dimension,
+            transfer_original_dims_to_merged=params.transfer_original_dims_to_merged,
         )
         
         print()
@@ -393,6 +450,89 @@ def run_merge_task(params: Parameters):
         import traceback
         traceback.print_exc()
         sys.exit(1)
+
+
+def run_remap_to_originals_task(params: Parameters):
+    """
+    Run the remap_to_originals task: one merged LAZ file -> original files folder.
+    All dimensions from the merged file are added to each original file (no hardcoded dimension list).
+    """
+    try:
+        from merge_tiles import (
+            add_original_dimensions_to_merged,
+            load_merged_file,
+            remap_to_original_input_files,
+        )
+    except ImportError as e:
+        print(f"Error: Could not import required modules: {e}")
+        sys.exit(1)
+
+    if not params.merged_laz:
+        print("Error: --merged-laz is required for remap_to_originals task")
+        sys.exit(1)
+    if not params.original_input_dir:
+        print("Error: --original-input-dir is required for remap_to_originals task")
+        sys.exit(1)
+
+    merged_laz = Path(params.merged_laz)
+    original_input_dir = Path(params.original_input_dir)
+    if not merged_laz.exists():
+        print(f"Error: Merged file not found: {merged_laz}")
+        sys.exit(1)
+    if not original_input_dir.exists():
+        print(f"Error: Original input directory not found: {original_input_dir}")
+        sys.exit(1)
+
+    output_dir = params.output_dir
+    if output_dir is None:
+        output_dir = original_input_dir.parent / "original_with_predictions"
+    else:
+        output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    workers = max(1, params.workers)
+    retile_buffer = 2.0
+    tolerance = 0.1
+
+    print("=" * 60)
+    print("Remap to originals: merged file -> original files")
+    print("=" * 60)
+    print(f"Merged file: {merged_laz}")
+    print(f"Original input dir: {original_input_dir}")
+    print(f"Output dir: {output_dir}")
+    print()
+
+    merged_points, merged_extra_dims = load_merged_file(merged_laz)
+    remap_to_original_input_files(
+        merged_points,
+        merged_extra_dims,
+        original_input_dir,
+        output_dir,
+        tolerance=tolerance,
+        num_threads=workers,
+        retile_buffer=retile_buffer,
+    )
+
+    # Add dimensions from original files to the merged file (optional)
+    if params.transfer_original_dims_to_merged:
+        output_merged_with_originals = (
+            Path(params.output_merged_with_originals)
+            if params.output_merged_with_originals is not None
+            else output_dir / "merged_with_originals.laz"
+        )
+        add_original_dimensions_to_merged(
+            merged_laz,
+            original_input_dir,
+            output_merged_with_originals,
+            tolerance=tolerance,
+            retile_buffer=retile_buffer,
+            num_threads=max(1, params.workers),
+        )
+    else:
+        print("  Skipping transfer of original dimensions to merged file (disabled).")
+
+    print()
+    print("Remap to originals complete.")
 
 
 def run_remap_merge_task(params: Parameters):
@@ -448,14 +588,11 @@ def run_remap_merge_task(params: Parameters):
     else:
         output_folder = Path(output_folder)
 
-    tolerance = params.tolerance if params.tolerance else 5.0
-
     # Get merge parameters
     workers = params.workers
     buffer = params.buffer
     overlap_threshold = params.overlap_threshold
     max_centroid_distance = params.max_centroid_distance
-    correspondence_tolerance = params.correspondence_tolerance
     max_volume_for_merge = params.max_volume_for_merge
     border_zone_width = params.border_zone_width
     min_cluster_size = params.min_cluster_size
@@ -468,10 +605,27 @@ def run_remap_merge_task(params: Parameters):
     print(f"Target folder: {target_folder}")
     print(f"Original tiles dir: {original_tiles_dir}")
     print(f"Output folder (remap): {output_folder}")
-    print(f"Tolerance: {tolerance}m")
     print()
 
     try:
+        # Resolve tile_bounds_tindex.json: use --tile_bounds_json if set and exists, else derive
+        candidate_json_paths = [
+            original_tiles_dir / "tile_bounds_tindex.json",
+            original_tiles_dir.parent / "tile_bounds_tindex.json",
+        ]
+        tile_bounds_json = None
+        if params.tile_bounds_json and params.tile_bounds_json.exists():
+            tile_bounds_json = params.tile_bounds_json
+        if tile_bounds_json is None:
+            for p in candidate_json_paths:
+                if p.exists():
+                    tile_bounds_json = p
+                    break
+        if tile_bounds_json is None:
+            raise FileNotFoundError(
+                "tile_bounds_tindex.json not found. Pass --tile_bounds_json /path/to/tile_bounds_tindex.json "
+                "or place it at one of: " + ", ".join(str(p) for p in candidate_json_paths)
+            )
         # Step 1: Remap predictions
         print("=" * 60)
         print("Step 1: Remapping predictions")
@@ -481,7 +635,8 @@ def run_remap_merge_task(params: Parameters):
             source_folder=source_folder,
             target_folder=target_folder,
             output_folder=output_folder,
-            tolerance=tolerance
+            tile_bounds_json=tile_bounds_json,
+            verbose=bool(params.verbose),
         )
 
         print()
@@ -516,12 +671,12 @@ def run_remap_merge_task(params: Parameters):
             segmented_dir=remapped_folder,
             output_tiles_dir=output_tiles_dir,
             original_tiles_dir=original_tiles_dir,
+            tile_bounds_json=tile_bounds_json,
             original_input_dir=original_input_dir,
             output_merged=output_merged,
             buffer=buffer,
             overlap_threshold=overlap_threshold,
             max_centroid_distance=max_centroid_distance,
-            correspondence_tolerance=correspondence_tolerance,
             max_volume_for_merge=max_volume_for_merge,
             border_zone_width=border_zone_width,
             min_cluster_size=min_cluster_size,
@@ -532,6 +687,8 @@ def run_remap_merge_task(params: Parameters):
             skip_merged_file=params.skip_merged_file,
             verbose=params.verbose,
             retile_buffer=retile_buffer,
+            instance_dimension=params.instance_dimension,
+            transfer_original_dims_to_merged=params.transfer_original_dims_to_merged,
         )
 
         print()
@@ -594,10 +751,13 @@ def main():
     
     # Manually map aliases that Pydantic might not generate flags for
     # --subsampled-segmented-folder -> --subsampled-10cm-folder
+    # --no-transfer-original-dims-to-merged -> --transfer-original-dims-to-merged False
     mapped_args = []
     for arg in remaining_args:
         if arg == '--subsampled-segmented-folder':
             mapped_args.append('--subsampled-10cm-folder')
+        elif arg == '--no-transfer-original-dims-to-merged':
+            mapped_args.extend(['--transfer-original-dims-to-merged', 'False'])
         else:
             mapped_args.append(arg)
     remaining_args = mapped_args
@@ -619,8 +779,8 @@ def main():
         # Restore original argv
         sys.argv = original_argv
     
-    # Show parameters if requested
-    if params.show_params:
+    # Show parameters if requested (flag handled by pre-parser; not in Parameters)
+    if pre_args.show_params:
         print_params(params)
         sys.exit(0)
     
@@ -641,11 +801,13 @@ def main():
         run_remap_task(params)
     elif params.task == "merge":
         run_merge_task(params)
+    elif params.task == "remap_to_originals":
+        run_remap_to_originals_task(params)
     elif params.task == "remap_merge":
         run_remap_merge_task(params)
     else:
         print(f"Error: Unknown task: {params.task}")
-        print("Valid tasks: tile, remap, merge, remap_merge")
+        print("Valid tasks: tile, remap, merge, remap_to_originals, remap_merge")
         sys.exit(1)
 
 

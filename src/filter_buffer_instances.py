@@ -127,6 +127,7 @@ def process_tile(
     output_file: Path,
     all_tile_names: List[str],
     buffer: float = 10.0,
+    instance_dimension: str = "PredInstance",
 ) -> Tuple[int, int, int]:
     """
     Process a single tile: load, filter buffer instances, save.
@@ -136,28 +137,24 @@ def process_tile(
     """
     print(f"Processing {input_file.name}...")
     
-    # Load LAZ file
     try:
         las = laspy.read(str(input_file), laz_backend=laspy.LazBackend.LazrsParallel)
     except Exception as e:
         print(f"  Error loading {input_file}: {e}")
         return 0, 0, 0
     
-    # Extract points and instances
     points = np.vstack((
         np.array(las.x),
         np.array(las.y),
         np.array(las.z)
     )).T
     
-    # Get instance IDs
-    if hasattr(las, 'PredInstance'):
-        instances = np.array(las.PredInstance)
+    if hasattr(las, instance_dimension):
+        instances = np.array(getattr(las, instance_dimension))
     elif hasattr(las, 'treeID'):
         instances = np.array(las.treeID)
     else:
-        print(f"  Warning: No instance attribute found in {input_file}")
-        # No instances to filter, just copy file
+        print(f"  Warning: No instance attribute ({instance_dimension}/treeID) found in {input_file}")
         output_file.parent.mkdir(parents=True, exist_ok=True)
         las.write(str(output_file), do_compress=True, laz_backend=laspy.LazBackend.LazrsParallel)
         return len(points), 0, 0

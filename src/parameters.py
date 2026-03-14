@@ -51,18 +51,12 @@ class Parameters(BaseSettings):
         validation_alias=AliasChoices("workers", "number-of-threads", "number_of_threads"),
     )
     
-    show_params: bool = Field(
-        False,
-        description="Show current parameter configuration and exit",
-        validation_alias=AliasChoices("show-params", "show_params"),
-    )
-    
     # ==========================================================================
     # Tile task parameters
     # ==========================================================================
     
     tile_length: Optional[int] = Field(
-        300,
+        100,
         description="Tile size in meters (only for 'tile' task)",
         validation_alias=AliasChoices("tile-length", "tile_length"),
     )
@@ -74,7 +68,7 @@ class Parameters(BaseSettings):
     )
     
     threads: Optional[int] = Field(
-        5,
+        10,
         description="Threads per COPC writer (only for 'tile' task)",
     )
     
@@ -92,9 +86,15 @@ class Parameters(BaseSettings):
     
     
     skip_dimension_reduction: bool = Field(
-        True,
+        False,
         description="Skip XYZ-only reduction, keep all point dimensions. Set to False only for raw pre-segmentation data (only for 'tile' task)",
         validation_alias=AliasChoices("skip-dimension-reduction", "skip_dimension_reduction"),
+    )
+    
+    instance_dimension: str = Field(
+        "PredInstance",
+        description="Name of the instance ID dimension in input files (default: PredInstance, fallback: treeID)",
+        validation_alias=AliasChoices("instance-dimension", "instance_dimension"),
     )
     
     num_spatial_chunks: Optional[int] = Field(
@@ -136,6 +136,12 @@ class Parameters(BaseSettings):
         description="Directory with original tile files for retiling (for 'merge' task)",
         validation_alias=AliasChoices("original-tiles-dir", "original_tiles_dir"),
     )
+
+    tile_bounds_json: Optional[Path] = Field(
+        default=None,
+        description="Path to tile_bounds_tindex.json for neighbor graph and remap matching (merge/remap_merge). If set, used instead of auto-derived paths.",
+        validation_alias=AliasChoices("tile-bounds-json", "tile_bounds_json"),
+    )
     
     original_input_dir: Optional[Path] = Field(
         default=None,
@@ -159,6 +165,28 @@ class Parameters(BaseSettings):
         default=None,
         description="Output folder for remapped files (auto-derived if not specified)",
         validation_alias=AliasChoices("output-folder", "output_folder"),
+    )
+
+    # ==========================================================================
+    # Remap-to-originals task parameters (one merged file -> original files folder)
+    # ==========================================================================
+
+    merged_laz: Optional[Path] = Field(
+        default=None,
+        description="Path to merged LAZ file (for 'remap_to_originals' task). All dimensions from this file are added to original files.",
+        validation_alias=AliasChoices("merged-laz", "merged_laz"),
+    )
+
+    output_merged_with_originals: Optional[Path] = Field(
+        default=None,
+        description="Path for merged LAZ with original-file dimensions added (for remap_to_originals). If unset, default to output_dir / merged_with_originals.laz.",
+        validation_alias=AliasChoices("output-merged-with-originals", "output_merged_with_originals"),
+    )
+
+    transfer_original_dims_to_merged: bool = Field(
+        True,
+        description="Transfer original-file dimensions (e.g. Intensity, RGB) to the merged point cloud. Applies to merge task (single-file path) and remap_to_originals task.",
+        validation_alias=AliasChoices("transfer-original-dims-to-merged", "transfer_original_dims_to_merged"),
     )
 
     # ==========================================================================
@@ -193,12 +221,6 @@ class Parameters(BaseSettings):
         3.0,
         description="Max centroid distance to merge instances in meters",
         validation_alias=AliasChoices("max-centroid-distance", "max_centroid_distance"),
-    )
-    
-    correspondence_tolerance: Optional[float] = Field(
-        0.05,
-        description="Max distance for point correspondence in meters (should be small ~5cm)",
-        validation_alias=AliasChoices("correspondence-tolerance", "correspondence_tolerance"),
     )
     
     max_volume_for_merge: Optional[float] = Field(
@@ -242,12 +264,6 @@ class Parameters(BaseSettings):
         description="Print detailed merge decisions",
     )
     
-    retile_buffer: Optional[float] = Field(
-        2.0,  # Fixed to 2.0m
-        description="Spatial buffer expansion in meters for filtering merged points during retiling (fixed: 2.0m)",
-        validation_alias=AliasChoices("retile-buffer", "retile_buffer"),
-    )
-
     # ==========================================================================
     # Validators
     # ==========================================================================
@@ -281,9 +297,7 @@ class Parameters(BaseSettings):
         "buffer",
         "overlap_threshold",
         "max_centroid_distance",
-        "correspondence_tolerance",
         "max_volume_for_merge",
-        "retile_buffer",
     )
     @classmethod
     def validate_merge_params(cls, v, info):
@@ -332,6 +346,7 @@ def print_params(params: Parameters):
     print(f"  input_dir: {params.input_dir}")
     print(f"  output_dir: {params.output_dir}")
     print(f"  workers: {params.workers}")
+    print(f"  instance_dimension: {params.instance_dimension}")
     
     print("\nTile Task:")
     print(f"  tile_length: {params.tile_length}")
@@ -347,7 +362,6 @@ def print_params(params: Parameters):
     print(f"  buffer: {params.buffer}")
     print(f"  overlap_threshold: {params.overlap_threshold}")
     print(f"  max_centroid_distance: {params.max_centroid_distance}")
-    print(f"  correspondence_tolerance: {params.correspondence_tolerance}")
     print(f"  max_volume_for_merge: {params.max_volume_for_merge}")
     print(f"  min_cluster_size: {params.min_cluster_size}")
     print(f"  disable_matching: {params.disable_matching}")
@@ -377,12 +391,11 @@ def get_merge_params(params: Parameters) -> dict:
         'buffer': params.buffer,
         'overlap_threshold': params.overlap_threshold,
         'max_centroid_distance': params.max_centroid_distance,
-        'correspondence_tolerance': params.correspondence_tolerance,
         'max_volume_for_merge': params.max_volume_for_merge,
         'min_cluster_size': params.min_cluster_size,
         'workers': params.workers,
         'verbose': params.verbose,
-        'retile_buffer': params.retile_buffer,
+        'instance_dimension': params.instance_dimension,
     }
 
 
@@ -390,14 +403,15 @@ def get_remap_params(params: Parameters) -> dict:
     """Get remap parameters as a dictionary for legacy compatibility."""
     return {
         'workers': params.workers,
+        'instance_dimension': params.instance_dimension,
     }
 
 
 # Legacy dict exports for backwards compatibility with modules that import them directly
 TILE_PARAMS = {
     'tile_length': 100,
-    'tile_buffer': 5,
-    'threads': 5,
+    'tile_buffer': 20,
+    'threads': 10,
     'workers': 4,
     'resolution_1': 0.02,
     'resolution_2': 0.1,
@@ -413,7 +427,6 @@ MERGE_PARAMS = {
     'buffer': 10.0,
     'overlap_threshold': 0.3,
     'max_centroid_distance': 3.0,
-    'correspondence_tolerance': 0.1,
     'max_volume_for_merge': 4.0,
     'min_cluster_size': 300,
     'workers': 4,
