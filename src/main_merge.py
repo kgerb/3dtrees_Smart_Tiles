@@ -20,19 +20,21 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import shutil
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 # Import parameters and core merge function
 from parameters import MERGE_PARAMS
-from merge_tiles import merge_tiles as core_merge_tiles
+from merge_tiles import add_original_dimensions_to_merged, merge_tiles as core_merge_tiles
 
 
 def run_merge(
     segmented_dir: Path,
     output_tiles_dir: Path,
     original_tiles_dir: Path,
+    tile_bounds_json: Path,
     original_input_dir: Optional[Path] = None,
     output_merged: Optional[Path] = None,
     buffer: float = 10.0,
@@ -50,6 +52,10 @@ def run_merge(
     verbose: bool = True,
     retile_buffer: float = 2.0,  # Fixed to 2.0m
     retile_max_radius: float = 0.1,
+    instance_dimension: str = "PredInstance",
+    transfer_original_dims_to_merged: bool = True,
+    threedtrees_dims: Optional[List[str]] = None,
+    threedtrees_suffix: str = "SAT",
 ) -> Path:
     """
     Run the tile merge pipeline.
@@ -63,7 +69,7 @@ def run_merge(
         buffer: Buffer zone distance in meters
         overlap_threshold: Overlap ratio threshold for instance matching
         max_centroid_distance: Max distance between centroids to merge instances
-        correspondence_tolerance: Max distance for point correspondence
+        correspondence_tolerance: Max distance for point correspondence (internal, not exposed via Parameters)
         max_volume_for_merge: Max convex hull volume for small instance merging
         num_threads: Number of workers for parallel processing
         enable_matching: Enable cross-tile instance matching
@@ -73,6 +79,7 @@ def run_merge(
         verbose: Print detailed merge decisions
         retile_buffer: Spatial buffer expansion in meters for filtering merged points during retiling
         retile_max_radius: Maximum distance threshold in meters for cKDTree nearest neighbor matching during retiling
+        transfer_original_dims_to_merged: If True (single-file path only), add original-file dimensions to the merged LAZ.
     
     Returns:
         Path to merged output file
@@ -90,10 +97,19 @@ def run_merge(
     
     if not output_tiles_dir.exists():
         output_tiles_dir.mkdir(parents=True, exist_ok=True)
+
+    # Validate tile bounds JSON (required)
+    if tile_bounds_json is None:
+        raise ValueError("tile_bounds_json is required but was not provided.")
+    if not tile_bounds_json.exists():
+        raise FileNotFoundError(
+            f"tile_bounds_tindex.json not found: {tile_bounds_json}. "
+            "Merge requires this file and will not run without it."
+        )
     
-    # Auto-derive output path if not provided
+    # Auto-derive output path if not provided (inside segmented dir so it is writable e.g. in Docker /out)
     if output_merged is None:
-        output_merged = segmented_dir.parent / "merged.laz"
+        output_merged = segmented_dir / "merged.laz"
 
     # OPTIMIZATION: If only one file in each folder, skip merge and just remap
     segmented_files = list(segmented_dir.glob("*.laz")) + list(segmented_dir.glob("*.las"))
@@ -156,7 +172,9 @@ def run_merge(
             _, success, message, point_count = remap_single_tile(
                 remapped_1cm_file,
                 original_file,
-                final_output_file
+                final_output_file,
+                threedtrees_dims=set(threedtrees_dims) if threedtrees_dims else None,
+                threedtrees_suffix=threedtrees_suffix,
             )
 
             if not success:
@@ -168,10 +186,42 @@ def run_merge(
             remapped_1cm_file.unlink()
             print(f"  Removed intermediate file: {remapped_1cm_file.name}")
 
+        # Step 3: Write merged file (remapped file renamed to output_merged)
+        # Use final_output_file if we remapped to original, else the 1cm remapped file
+        merged_source = (
+            output_tiles_dir / f"{original_input_files[0].stem}_segmented.laz"
+            if original_input_dir
+            else remapped_1cm_file
+        )
+        if not skip_merged_file and output_merged is not None:
+            output_merged = Path(output_merged)
+            output_merged.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(str(merged_source), str(output_merged))
+            print(f"\nStep 3: Merged file written: {output_merged.name}")
+
+            # Ensure merged file has same dimensions as original (reuse remap-to-originals logic)
+            if original_input_dir and transfer_original_dims_to_merged:
+                merged_tmp = output_merged.parent / (output_merged.stem + "_with_originals_dims.laz")
+                add_original_dimensions_to_merged(
+                    output_merged,
+                    original_input_dir,
+                    merged_tmp,
+                    tolerance=0.1,
+                    retile_buffer=retile_buffer,
+                    num_threads=4,
+                )
+                shutil.copy2(str(merged_tmp), str(output_merged))
+                merged_tmp.unlink(missing_ok=True)
+                print(f"  ✓ Merged file has same dimensions as original (added original-file dimensions)")
+            elif original_input_dir and not transfer_original_dims_to_merged:
+                print(f"  Skipping transfer of original dimensions to merged (disabled).")
+
         print("\n" + "=" * 60)
         print("Single-file optimization complete")
         print("=" * 60)
         print(f"Output: {output_tiles_dir}")
+        if not skip_merged_file and output_merged is not None:
+            print(f"Merged file: {output_merged}")
 
         return output_merged
 
@@ -188,6 +238,7 @@ def run_merge(
     if enable_volume_merge:
         print(f"  Max volume: {max_volume_for_merge} m³")
     print(f"Workers: {num_threads}")
+    print(f"Tile bounds JSON: {tile_bounds_json}")
     if original_input_dir:
         print(f"Original input dir: {original_input_dir} (Stage 7 enabled)")
     print()
@@ -198,6 +249,7 @@ def run_merge(
         original_tiles_dir=original_tiles_dir,
         output_merged=output_merged,
         output_tiles_dir=output_tiles_dir,
+        tile_bounds_json=tile_bounds_json,
         original_input_dir=original_input_dir,
         buffer=buffer,
         overlap_threshold=overlap_threshold,
@@ -211,8 +263,12 @@ def run_merge(
         skip_merged_file=skip_merged_file,
         verbose=verbose,
         retile_buffer=retile_buffer,
+        instance_dimension=instance_dimension,
+        transfer_original_dims_to_merged=transfer_original_dims_to_merged,
+        threedtrees_dims=threedtrees_dims,
+        threedtrees_suffix=threedtrees_suffix,
     )
-    
+
     return output_merged
 
 
@@ -251,6 +307,13 @@ def main() -> None:
         required=True,
         help="Directory with original tile files for retiling (required)"
     )
+
+    parser.add_argument(
+        "--tile_bounds_json",
+        type=Path,
+        required=True,
+        help="Path to tile_bounds_tindex.json (required; used for neighbor graph)"
+    )
     
     parser.add_argument(
         "--original_input_dir",
@@ -283,10 +346,10 @@ def main() -> None:
     parser.add_argument(
         "--correspondence_tolerance",
         type=float,
-        default=MERGE_PARAMS.get('correspondence_tolerance', 0.05),
-        help=f"Point correspondence tolerance (default: {MERGE_PARAMS.get('correspondence_tolerance', 0.05)})"
+        default=0.05,
+        help="Max distance for point correspondence during merge (default: 0.05m)"
     )
-    
+
     parser.add_argument(
         "--max_volume_for_merge",
         type=float,
@@ -368,6 +431,7 @@ def main() -> None:
             segmented_dir=args.segmented_dir,
             output_tiles_dir=args.output_tiles_dir,
             original_tiles_dir=args.original_tiles_dir,
+            tile_bounds_json=args.tile_bounds_json,
             original_input_dir=args.original_input_dir,
             output_merged=args.output_merged,
             buffer=args.buffer,
