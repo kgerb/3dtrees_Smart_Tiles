@@ -75,11 +75,17 @@ def run_tile_task(params: Parameters):
     tile_buffer = params.tile_buffer
     threads = params.threads
     workers = params.workers
-    skip_dimension_reduction = params.skip_dimension_reduction
+    # Coerce to bool so CLI/env string "True"/"true"/"1" is respected (Pydantic usually does this; be explicit)
+    skip_dimension_reduction = bool(
+        params.skip_dimension_reduction if isinstance(params.skip_dimension_reduction, bool)
+        else str(params.skip_dimension_reduction).strip().lower() in ("true", "1", "yes")
+    )
     num_spatial_chunks = params.num_spatial_chunks
     res1 = params.resolution_1
     res2 = params.resolution_2
     tiling_threshold = params.tiling_threshold
+    chunk_size = params.chunk_size
+    finalize_strategy = params.finalize_strategy
 
     print("=" * 60)
     print("Running Tile Task (Python Pipeline)")
@@ -91,15 +97,17 @@ def run_tile_task(params: Parameters):
     print(f"Workers: {workers}")
     print(f"Threads per writer: {threads}")
     print(f"Skip dimension reduction: {skip_dimension_reduction}")
+    dimension_reduction = not skip_dimension_reduction
+    print(f"Subsampling dimensions: {'minimal (standard dims only)' if dimension_reduction else 'keep all (including extra_dims)'}")
     print(f"Resolutions: {res1}m ({int(res1*100)}cm), {res2}m ({int(res2*100)}cm)")
     if tiling_threshold is not None:
         print(f"Tiling threshold: {tiling_threshold} MB")
+    print(f"Chunk size: {chunk_size:,} points")
+    print(f"Finalize strategy: {finalize_strategy}")
     print()
     
     try:
-        # Step 1-4: Tiling pipeline
-        # Convert skip_dimension_reduction to dimension_reduction (inverted logic)
-        dimension_reduction = not skip_dimension_reduction
+        # Step 1-4: Tiling pipeline (dimension_reduction not used in tiling; only in subsampling below)
         tiles_dir = run_tiling_pipeline(
             input_dir=input_dir,
             output_dir=output_dir,
@@ -109,7 +117,9 @@ def run_tile_task(params: Parameters):
             threads=threads,
             max_tile_procs=workers,
             dimension_reduction=dimension_reduction,
-            tiling_threshold=tiling_threshold
+            tiling_threshold=tiling_threshold,
+            chunk_size=chunk_size,
+            finalize_strategy=finalize_strategy,
         )
 
         # Check if tiling was skipped (returns copc_dir instead of tiles_dir)
@@ -144,7 +154,8 @@ def run_tile_task(params: Parameters):
             num_cores=workers,
             num_threads=num_spatial_chunks,  # num_spatial_chunks maps to num_threads in the function
             output_prefix=output_prefix,
-            output_base_dir=output_dir  # Output directly to output_dir, not under tiles_dir
+            output_base_dir=output_dir,  # Output directly to output_dir, not under tiles_dir
+            dimension_reduction=dimension_reduction,  # True = minimal (standard dims only); False = keep extra_dims
         )
 
         # Step 7: Update tile_bounds_tindex.json with actual bounds from created tiles
@@ -363,6 +374,7 @@ def run_merge_task(params: Parameters):
                 output_folder=output_folder,
                 tile_bounds_json=remap_tile_bounds_json,
                 verbose=bool(params.verbose),
+                num_workers=workers,
             )
         
         # Step 2: Merge tiles
@@ -502,10 +514,11 @@ def run_remap_to_originals_task(params: Parameters):
     print(f"Output dir: {output_dir}")
     print()
 
-    merged_points, merged_extra_dims = load_merged_file(merged_laz)
+    merged_points, merged_extra_dims, merged_extra_dim_params = load_merged_file(merged_laz)
     remap_to_original_input_files(
         merged_points,
         merged_extra_dims,
+        merged_extra_dim_params,
         original_input_dir,
         output_dir,
         tolerance=tolerance,

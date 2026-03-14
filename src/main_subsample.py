@@ -76,7 +76,7 @@ def get_file_bounds(filepath: Path) -> Optional[Tuple[float, float, float, float
         return None
 
 
-def subsample_tile_chunk(args: Tuple[Path, str, float, Path, int, int]) -> Tuple[Path, int]:
+def subsample_tile_chunk(args: Tuple[Path, str, float, Path, int, int, bool]) -> Tuple[Path, int]:
     """
     Subsample a spatial chunk of a tile using PDAL with COPC-optimized bounds filter.
     
@@ -85,12 +85,13 @@ def subsample_tile_chunk(args: Tuple[Path, str, float, Path, int, int]) -> Tuple
     - Output is always LAZ format (compressed LAS)
     
     Args:
-        args: Tuple of (input_file, bounds_str, resolution, output_dir, chunk_idx, total_chunks)
+        args: Tuple of (input_file, bounds_str, resolution, output_dir, chunk_idx, total_chunks, dimension_reduction)
+              dimension_reduction: If True, write only standard dimensions (no extra_dims); minimal output.
     
     Returns:
         Tuple of (output_file, point_count)
     """
-    input_file, bounds_str, resolution, output_dir, chunk_idx, total_chunks = args
+    input_file, bounds_str, resolution, output_dir, chunk_idx, total_chunks, dimension_reduction = args
     
     try:
         # Determine reader type - can read COPC or LAS
@@ -101,6 +102,19 @@ def subsample_tile_chunk(args: Tuple[Path, str, float, Path, int, int]) -> Tuple
         chunk_file = output_dir / f"{input_file.stem}_chunk{chunk_idx}.laz"
         
         # Build pipeline - use COPC bounds filtering if available
+        # When keeping all dims, do not set dataformat_id=0 (format 0 has no extra bytes); use LAS 1.4 for format 6/7.
+        writer_opts = {
+            "type": "writers.las",
+            "filename": str(chunk_file),
+            "compression": True,
+        }
+        if dimension_reduction:
+            writer_opts["minor_version"] = 2
+            writer_opts["dataformat_id"] = 0  # Minimal: 20 bytes only (LAS 1.2)
+        else:
+            writer_opts["minor_version"] = 4  # LAS 1.4 required for point format 6/7 (extra dims)
+            writer_opts["extra_dims"] = "all"
+
         if is_copc:
             # COPC: Use bounds parameter directly in reader (most efficient)
             pipeline = {
@@ -110,47 +124,21 @@ def subsample_tile_chunk(args: Tuple[Path, str, float, Path, int, int]) -> Tuple
                         "filename": str(input_file),
                         "bounds": bounds_str  # COPC native bounds filtering - very efficient
                     },
-                    {
-                        "type": "filters.voxelcentroidnearestneighbor",
-                        "cell": resolution
-                    },
-                    {
-                        "type": "writers.las",  # Always write as LAZ (compressed LAS)
-                        "filename": str(chunk_file),
-                        "compression": True,
-                        "extra_dims": "all",  # Preserve extra dimensions like PredInstance
-                        "minor_version": 2,
-                        "dataformat_id": 0
-                    }
+                    {"type": "filters.voxelcentroidnearestneighbor", "cell": resolution},
+                    writer_opts,
                 ]
             }
         else:
             # LAS: Use filters.crop as fallback (LAS readers don't support bounds parameter)
             pipeline = {
                 "pipeline": [
-                    {
-                        "type": reader_type,
-                        "filename": str(input_file)
-                    },
-                    {
-                        "type": "filters.crop",
-                        "bounds": bounds_str
-                    },
-                    {
-                        "type": "filters.voxelcentroidnearestneighbor",
-                        "cell": resolution
-                    },
-                    {
-                        "type": "writers.las",
-                        "filename": str(chunk_file),
-                        "compression": True,
-                        "extra_dims": "all",
-                        "minor_version": 2,
-                        "dataformat_id": 0
-                    }
+                    {"type": reader_type, "filename": str(input_file)},
+                    {"type": "filters.crop", "bounds": bounds_str},
+                    {"type": "filters.voxelcentroidnearestneighbor", "cell": resolution},
+                    writer_opts,
                 ]
             }
-        
+
         # Write and execute pipeline
         pipeline_file = output_dir / f"_pipeline_chunk{chunk_idx}.json"
         with open(pipeline_file, 'w') as f:
@@ -199,7 +187,7 @@ def subsample_tile_chunk(args: Tuple[Path, str, float, Path, int, int]) -> Tuple
         return (None, 0)
 
 
-def subsample_single_file(args: Tuple[Path, Path, float, Path, int]) -> Tuple[str, bool, str, int]:
+def subsample_single_file(args: Tuple[Path, Path, float, Path, int, bool]) -> Tuple[str, bool, str, int]:
     """
     Subsample a single file by splitting it into subtiles along X-axis and processing in parallel.
     
@@ -214,7 +202,7 @@ def subsample_single_file(args: Tuple[Path, Path, float, Path, int]) -> Tuple[st
     Returns:
         Tuple of (filename, success, message, point_count)
     """
-    input_file, output_file, resolution, pipeline_dir, num_threads = args
+    input_file, output_file, resolution, pipeline_dir, num_threads, dimension_reduction = args
     try:
         print(f"    → Processing {input_file.name}...")
         
@@ -222,7 +210,7 @@ def subsample_single_file(args: Tuple[Path, Path, float, Path, int]) -> Tuple[st
         bounds = get_file_bounds(input_file)
         if not bounds:
             # Fall back to simple single-pass subsampling when bounds cannot be determined
-            return subsample_simple(input_file, output_file, resolution, pipeline_dir)
+            return subsample_simple(input_file, output_file, resolution, pipeline_dir, dimension_reduction)
         
         minx, maxx, miny, maxy = bounds
 
@@ -231,7 +219,7 @@ def subsample_single_file(args: Tuple[Path, Path, float, Path, int]) -> Tuple[st
         # from the COPC reader. In that case, fall back to the simple
         # single-pass subsampling without spatial chunking.
         if maxx - minx == 0 or maxy - miny == 0:
-            return subsample_simple(input_file, output_file, resolution, pipeline_dir)
+            return subsample_simple(input_file, output_file, resolution, pipeline_dir, dimension_reduction)
 
         # Split into num_threads subtiles along X-axis only
         grid_x = num_threads
@@ -255,7 +243,7 @@ def subsample_single_file(args: Tuple[Path, Path, float, Path, int]) -> Tuple[st
             chunk_maxy = maxy
             
             bounds_str = f"([{chunk_minx},{chunk_maxx}],[{chunk_miny},{chunk_maxy}])"
-            chunk_tasks.append((input_file, bounds_str, resolution, chunk_dir, chunk_idx, num_threads))
+            chunk_tasks.append((input_file, bounds_str, resolution, chunk_dir, chunk_idx, num_threads, dimension_reduction))
         
         # Process chunks in parallel using ProcessPoolExecutor for true CPU parallelism
         chunk_files = []
@@ -283,20 +271,22 @@ def subsample_single_file(args: Tuple[Path, Path, float, Path, int]) -> Tuple[st
         if not output_file.name.endswith('.laz'):
             output_file = output_file.parent / (output_file.stem + '.laz')
         
+        merge_writer = {
+            "type": "writers.las",
+            "filename": str(output_file),
+            "compression": True,
+        }
+        if dimension_reduction:
+            merge_writer["minor_version"] = 2
+            merge_writer["dataformat_id"] = 0
+        else:
+            merge_writer["minor_version"] = 4
+            merge_writer["extra_dims"] = "all"
         merge_pipeline = {
             "pipeline": [
                 *[{"type": reader_type, "filename": str(f)} for f in chunk_files],
-                {
-                    "type": "filters.merge"
-                },
-                {
-                    "type": "writers.las",  # Always write as LAZ (compressed LAS)
-                    "filename": str(output_file),
-                    "compression": True,
-                    "extra_dims": "all",  # Preserve extra dimensions like PredInstance
-                    "minor_version": 2,
-                    "dataformat_id": 0
-                }
+                {"type": "filters.merge"},
+                merge_writer,
             ]
         }
         
@@ -349,17 +339,21 @@ def subsample_single_file(args: Tuple[Path, Path, float, Path, int]) -> Tuple[st
         return (input_file.name, False, str(e), 0)
 
 
-def subsample_simple(input_file: Path, output_file: Path, resolution: float, pipeline_dir: Path) -> Tuple[str, bool, str, int]:
+def subsample_simple(
+    input_file: Path, output_file: Path, resolution: float, pipeline_dir: Path, dimension_reduction: bool = True
+) -> Tuple[str, bool, str, int]:
     """
     Simple single-pass subsampling (fallback method) with COPC reader optimization.
     
     Uses COPC reader for efficient reading, but always outputs LAZ format.
+    When dimension_reduction is True, only standard dimensions are written (minimal output).
     
     Args:
         input_file: Input file path
         output_file: Output file path
         resolution: Voxel resolution
         pipeline_dir: Directory for pipeline files
+        dimension_reduction: If True, write only standard dimensions (no extra_dims).
     
     Returns:
         Tuple of (filename, success, message, point_count)
@@ -372,18 +366,22 @@ def subsample_simple(input_file: Path, output_file: Path, resolution: float, pip
         if not output_file.name.endswith('.laz'):
             output_file = output_file.parent / (output_file.stem + '.laz')
         
+        writer_opts = {
+            "type": "writers.las",
+            "filename": str(output_file),
+            "compression": True,
+        }
+        if dimension_reduction:
+            writer_opts["minor_version"] = 2
+            writer_opts["dataformat_id"] = 0
+        else:
+            writer_opts["minor_version"] = 4
+            writer_opts["extra_dims"] = "all"
         pipeline = {
             "pipeline": [
                 {"type": reader_type, "filename": str(input_file)},
                 {"type": "filters.voxelcentroidnearestneighbor", "cell": resolution},
-                {
-                    "type": "writers.las",  # Always write as LAZ (compressed LAS)
-                    "filename": str(output_file),
-                    "compression": True,
-                    "extra_dims": "all",  # Preserve extra dimensions like PredInstance
-                    "minor_version": 2,
-                    "dataformat_id": 0
-                }
+                writer_opts,
             ]
         }
         
@@ -436,7 +434,8 @@ def subsample_parallel(
     resolution: float,
     num_cores: int,
     num_threads: int,
-    output_prefix: Optional[str] = None
+    output_prefix: Optional[str] = None,
+    dimension_reduction: bool = True,
 ) -> List[Path]:
     """
     Subsample all files in directory using parallel chunk processing.
@@ -444,6 +443,7 @@ def subsample_parallel(
     Files are processed sequentially (one at a time), but each file is split
     spatially into chunks along X-axis and processed in parallel.
     Uses PDAL voxelcentroidnearestneighbor filter.
+    When dimension_reduction is True, only standard LAS dimensions are written (minimal output).
     
     Args:
         input_dir: Directory containing input files
@@ -452,6 +452,7 @@ def subsample_parallel(
         num_cores: Not used (kept for compatibility)
         num_threads: Number of spatial chunks per file (from TILE_PARAMS['threads'])
         output_prefix: Optional prefix for output filenames
+        dimension_reduction: If True, write only standard dimensions (no extra_dims); default True = minimal.
     
     Returns:
         List of created output file paths
@@ -530,7 +531,7 @@ def subsample_parallel(
             print(f"    ⊙ Skipping {input_file.name} (already exists)")
             continue
         
-        tasks.append((input_file, output_file, resolution, pipeline_dir, num_threads))
+        tasks.append((input_file, output_file, resolution, pipeline_dir, num_threads, dimension_reduction))
     
     if not tasks:
         print(f"    ✓ All files already subsampled")
@@ -574,7 +575,8 @@ def run_subsample_pipeline(
     num_cores: Optional[int] = None,
     num_threads: Optional[int] = None,
     output_prefix: Optional[str] = None,
-    output_base_dir: Optional[Path] = None
+    output_base_dir: Optional[Path] = None,
+    dimension_reduction: bool = True,
 ) -> Tuple[Path, Path]:
     """
     Run the complete subsampling pipeline.
@@ -585,6 +587,7 @@ def run_subsample_pipeline(
     
     Files are processed sequentially (one at a time), but each file is split
     spatially into num_threads chunks along X-axis and processed in parallel.
+    When dimension_reduction is True (default), only standard LAS dimensions are written (minimal output).
     
     Args:
         tiles_dir: Directory containing tile COPC files (input)
@@ -594,6 +597,7 @@ def run_subsample_pipeline(
         num_threads: Number of parallel chunks per file (default: from TILE_PARAMS['threads'])
         output_prefix: Optional prefix for output filenames
         output_base_dir: Base directory for output (default: parent of tiles_dir)
+        dimension_reduction: If True, write only standard dimensions (minimal); if False, keep extra_dims (e.g. PredInstance).
     
     Returns:
         Tuple of (subsampled_res1_dir, subsampled_res2_dir)
@@ -626,6 +630,7 @@ def run_subsample_pipeline(
     print(f"Resolution 2: {res2}m ({res2_cm}cm)")
     print(f"CPU cores: {num_cores}")
     print(f"Threads (chunks per file): {num_threads}")
+    print(f"Dimension reduction: {dimension_reduction} ({'minimal (standard dims only)' if dimension_reduction else 'keep all (extra_dims preserved)'})")
     print()
     
     # Step 1: Subsample to resolution 1
@@ -639,7 +644,8 @@ def run_subsample_pipeline(
         resolution=res1,
         num_cores=num_cores,
         num_threads=num_threads,
-        output_prefix=output_prefix
+        output_prefix=output_prefix,
+        dimension_reduction=dimension_reduction,
     )
     
     if not res1_files:
@@ -660,7 +666,8 @@ def run_subsample_pipeline(
         resolution=res2,
         num_cores=num_cores,
         num_threads=num_threads,
-        output_prefix=output_prefix
+        output_prefix=output_prefix,
+        dimension_reduction=dimension_reduction,
     )
     
     if not res2_files:

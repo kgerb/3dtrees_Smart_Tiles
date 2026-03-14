@@ -337,8 +337,13 @@ def main() -> None:
         help=f"Max centroid distance (default: {MERGE_PARAMS.get('max_centroid_distance', 3.0)})"
     )
     
-    # correspondence_tolerance left as internal argument; CLI uses default from MERGE_PARAMS
-    
+    parser.add_argument(
+        "--correspondence_tolerance",
+        type=float,
+        default=0.05,
+        help="Max distance for point correspondence during merge (default: 0.05m)"
+    )
+
     parser.add_argument(
         "--max_volume_for_merge",
         type=float,

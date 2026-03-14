@@ -21,12 +21,14 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import laspy
+from concurrent.futures import ProcessPoolExecutor
 from scipy.spatial import cKDTree
 
 # For JSON-based file matching (same grid as merge)
 from merge_tiles import (
     build_neighbor_graph_from_bounds_json,
     _match_tiles_to_json_bounds,
+    extra_bytes_params_from_dimension_info,
 )  
 
 
@@ -251,7 +253,7 @@ def remap_single_tile(
             print(f"    Warning: No extra dimensions found in segmented file")
         
         # Resolve names and collect params for batch add
-        dims_to_add = []  # (out_name, source_dim_name, dtype)
+        dims_to_add = []  # (extra_params, source_dim_name)
         for dim_info in source_extra_dims:
             dim_name = dim_info.name
             out_name = dim_name
@@ -260,16 +262,13 @@ def remap_single_tile(
                 while f"{dim_name}_{suffix}" in target_extra_dim_names:
                     suffix += 1
                 out_name = f"{dim_name}_{suffix}"
-            dims_to_add.append((out_name, dim_name, dim_info.dtype))
+            dims_to_add.append((extra_bytes_params_from_dimension_info(dim_info, name=out_name), dim_name))
             target_extra_dim_names.add(out_name)
         
         if dims_to_add:
-            target_las.add_extra_dims([
-                laspy.ExtraBytesParams(name=out_name, type=dtype)
-                for out_name, _, dtype in dims_to_add
-            ])
-            for out_name, src_name, _ in dims_to_add:
-                setattr(target_las, out_name, getattr(segmented_las, src_name)[indices])
+            target_las.add_extra_dims([params for params, _ in dims_to_add])
+            for params, src_name in dims_to_add:
+                setattr(target_las, params.name, getattr(segmented_las, src_name)[indices])
         
         # Create output directory if needed
         output_file.parent.mkdir(parents=True, exist_ok=True)
@@ -538,6 +537,12 @@ def find_matching_files(
     return matches
 
 
+def _remap_worker_item(item):
+    """Unpack work item and call remap_single_tile; must be at module level for ProcessPoolExecutor pickle."""
+    src, tgt, out, _tid = item
+    return remap_single_tile(src, tgt, out)
+
+
 def remap_all_tiles(
     source_folder: Path,
     target_folder: Path,
@@ -545,6 +550,7 @@ def remap_all_tiles(
     overlap_threshold: float = 99.0,
     verbose: bool = False,
     tile_bounds_json: Optional[Path] = None,
+    num_workers: int = 4,
 ) -> Path:
     """
     Remap predictions from source files to target files for all tiles.
@@ -559,6 +565,7 @@ def remap_all_tiles(
         overlap_threshold: Minimum spatial overlap percentage required (default: 99.0%)
         verbose: If True, print detailed matching diagnostics
         tile_bounds_json: Optional path to tile_bounds_tindex.json for grid-based matching
+        num_workers: Number of parallel processes (default: 4); use parameters.workers in run.py
 
     Returns:
         Path to output folder
@@ -605,45 +612,39 @@ def remap_all_tiles(
     print(f"Found {len(matches)} matching file pairs")
     print()
     
-    # Process each tile
+    # Build work items, skipping already-processed tiles
     successful = 0
     failed = 0
     total_points = 0
-    
-    for i, (source_file, target_file, tile_id) in enumerate(matches, 1):
-        # Get point count from target file header for display
-        target_bounds = get_file_bounds(target_file)
-        target_header = None
-        try:
-            with laspy.open(str(target_file), laz_backend=laspy.LazBackend.LazrsParallel) as las:
-                target_header = las.header
-        except Exception:
-            pass
-        
-        point_count_display = f"{target_header.point_count:,} points" if target_header else "points"
-        print(f"[{i}/{len(matches)}] Processing tile {tile_id} ({point_count_display})...")
-        
+    work_items = []
+
+    for source_file, target_file, tile_id in matches:
         output_file = output_folder / f"{tile_id}_segmented_remapped.laz"
-        
-        # Skip if already exists
         if output_file.exists() and output_file.stat().st_size > 0:
-            print(f"  Skipping (already exists)")
             successful += 1
             continue
-        
-        tile_id_result, success, message, point_count = remap_single_tile(
-            source_file,
-            target_file,
-            output_file
-        )
-        
-        if success:
-            successful += 1
-            total_points += point_count
-            print(f"  ✓ Completed: {point_count:,} points")
-        else:
-            failed += 1
-            print(f"  ✗ {message}")
+        work_items.append((source_file, target_file, output_file, tile_id))
+
+    if successful > 0:
+        print(f"  Skipping {successful} already processed tiles")
+
+    if len(work_items) == 0:
+        print(f"  All tiles already processed!")
+    else:
+        n_procs = min(max(1, num_workers), len(work_items))
+        print(f"  Processing {len(work_items)} tiles with {n_procs} workers...")
+
+        with ProcessPoolExecutor(max_workers=n_procs) as executor:
+            for i, result in enumerate(executor.map(_remap_worker_item, work_items)):
+                tile_id_result, success, message, point_count = result
+                tile_id = work_items[i][3]
+                if success:
+                    successful += 1
+                    total_points += point_count
+                    print(f"  [{i+1}/{len(work_items)}] ✓ {tile_id}: {point_count:,} points")
+                else:
+                    failed += 1
+                    print(f"  [{i+1}/{len(work_items)}] ✗ {tile_id}: {message}")
     
     # Summary
     print()
@@ -711,6 +712,12 @@ Examples:
         action="store_true",
         help="Print detailed matching diagnostics"
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=4,
+        help="Number of parallel processes (default: 4)"
+    )
 
     args = parser.parse_args()
 
@@ -723,6 +730,7 @@ Examples:
             overlap_threshold=99.0,
             verbose=args.verbose,
             tile_bounds_json=args.tile_bounds_json,
+            num_workers=args.workers,
         )
         print(f"\nRemapped files ready: {output_folder}")
     except Exception as e:
@@ -732,4 +740,3 @@ Examples:
 
 if __name__ == "__main__":
     main()
-

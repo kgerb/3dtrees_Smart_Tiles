@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Visualize COPC file extents and generated tile extents.
-Shows input COPC files and output tiles on the same plot.
+Visualize source point cloud file extents and generated tile extents.
+Shows input LAZ/LAS file extents and output tiles on the same plot.
 """
 
 import json
@@ -21,8 +21,8 @@ except ImportError as e:
     sys.exit(1)
 
 
-def load_copc_extents(tindex_path: Path, target_crs: str = "EPSG:32632"):
-    """Load COPC file extents from tindex and transform to target CRS."""
+def load_source_extents(tindex_path: Path, target_crs: str = "EPSG:32632"):
+    """Load source point cloud file extents from tindex and transform to target CRS."""
     extents = []
     filenames = []
     
@@ -56,7 +56,7 @@ def load_copc_extents(tindex_path: Path, target_crs: str = "EPSG:32632"):
                 # Actually need to transform from geographic to projected
                 try:
                     transformer = Transformer.from_crs(src_crs, target_crs, always_xy=True)
-                    print(f"Transforming COPC extents from {src_crs} to {target_crs}")
+                    print(f"Transforming source extents from {src_crs} to {target_crs}")
                     corners = [
                         transformer.transform(xmin, ymin),
                         transformer.transform(xmin, ymax),
@@ -103,21 +103,21 @@ def load_tile_extents(tile_bounds_json: Path):
 
 
 def plot_extents(tindex_path: Path, tile_bounds_json: Path, output_png: Path):
-    """Create visualization of COPC files and tiles."""
+    """Create visualization of source files and tiles."""
     print("Loading tile extents...")
     tiles, proj_srs = load_tile_extents(tile_bounds_json)
     print(f"Found {len(tiles)} tiles")
     print(f"Tiles are in CRS: {proj_srs}")
-    
-    print("Loading COPC file extents from tindex...")
-    copc_extents, copc_names = load_copc_extents(tindex_path, target_crs=proj_srs)
-    print(f"Found {len(copc_extents)} COPC files")
+
+    print("Loading source file extents from tindex...")
+    source_extents, source_names = load_source_extents(tindex_path, target_crs=proj_srs)
+    print(f"Found {len(source_extents)} source files")
     
     # Calculate overall extent
     all_xs = []
     all_ys = []
     
-    for xmin, ymin, xmax, ymax in copc_extents:
+    for xmin, ymin, xmax, ymax in source_extents:
         all_xs.extend([xmin, xmax])
         all_ys.extend([ymin, ymax])
     
@@ -136,21 +136,21 @@ def plot_extents(tindex_path: Path, tile_bounds_json: Path, output_png: Path):
     # Create figure
     fig, ax = plt.subplots(1, 1, figsize=(16, 12))
     
-    # Plot COPC file extents
-    copc_patches = []
-    for xmin, ymin, xmax, ymax in copc_extents:
+    # Plot source file extents
+    source_patches = []
+    for xmin, ymin, xmax, ymax in source_extents:
         width = xmax - xmin
         height = ymax - ymin
         rect = mpatches.Rectangle((xmin, ymin), width, height, 
                                   edgecolor='blue', facecolor='lightblue', 
                                   alpha=0.5, linewidth=1.5)
-        copc_patches.append(rect)
-    
-    copc_collection = PatchCollection(copc_patches, match_original=True)
-    ax.add_collection(copc_collection)
-    
-    # Add COPC file labels
-    for (xmin, ymin, xmax, ymax), name in zip(copc_extents, copc_names):
+        source_patches.append(rect)
+
+    source_collection = PatchCollection(source_patches, match_original=True)
+    ax.add_collection(source_collection)
+
+    # Add source file labels
+    for (xmin, ymin, xmax, ymax), name in zip(source_extents, source_names):
         center_x = (xmin + xmax) / 2
         center_y = (ymin + ymax) / 2
         ax.text(center_x, center_y, name, 
@@ -186,18 +186,18 @@ def plot_extents(tindex_path: Path, tile_bounds_json: Path, output_png: Path):
     ax.set_aspect('equal')
     ax.set_xlabel(f'X (Projected CRS: {proj_srs})', fontsize=12)
     ax.set_ylabel(f'Y (Projected CRS: {proj_srs})', fontsize=12)
-    ax.set_title('COPC Files and Generated Tiles\n(Blue = COPC files, Light red = Tiles)', 
+    ax.set_title('Source Files and Generated Tiles\n(Blue = source LAZ/LAS, Light red = Tiles)',
                  fontsize=14, weight='bold')
     ax.grid(True, alpha=0.3)
-    
+
     # Add legend
-    copc_legend = mpatches.Patch(color='lightblue', alpha=0.5, label='COPC file extent')
+    source_legend = mpatches.Patch(color='lightblue', alpha=0.5, label='Source file extent')
     tile_legend = mpatches.Patch(facecolor='mistyrose', edgecolor='indianred', 
                                  alpha=0.4, linewidth=2, label='Tile extent')
-    ax.legend(handles=[copc_legend, tile_legend], loc='upper right', fontsize=10)
-    
+    ax.legend(handles=[source_legend, tile_legend], loc='upper right', fontsize=10)
+
     # Add statistics text box
-    stats_text = f'COPC Files: {len(copc_extents)}\nTiles: {len(tiles)}'
+    stats_text = f'Source files: {len(source_extents)}\nTiles: {len(tiles)}'
     ax.text(0.02, 0.98, stats_text, transform=ax.transAxes,
             fontsize=10, verticalalignment='top',
             bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
@@ -208,7 +208,7 @@ def plot_extents(tindex_path: Path, tile_bounds_json: Path, output_png: Path):
     output_png.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(output_png, dpi=300, bbox_inches='tight')
     print(f"\nVisualization saved to: {output_png}")
-    print(f"  - {len(copc_extents)} COPC files (blue)")
+    print(f"  - {len(source_extents)} source files (blue)")
     print(f"  - {len(tiles)} tiles (light red)")
     
     # Optionally show plot
@@ -217,7 +217,7 @@ def plot_extents(tindex_path: Path, tile_bounds_json: Path, output_png: Path):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Visualize COPC file extents and generated tile extents"
+        description="Visualize source file extents and generated tile extents"
     )
     parser.add_argument(
         "tindex_path",

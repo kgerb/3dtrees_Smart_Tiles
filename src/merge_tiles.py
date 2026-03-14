@@ -56,6 +56,21 @@ class TileData:
     extra_dims: Dict[str, np.ndarray] = field(default_factory=dict)
 
 
+def extra_bytes_params_from_dimension_info(
+    dim_info,
+    name: Optional[str] = None,
+) -> laspy.ExtraBytesParams:
+    """Build ExtraBytesParams from laspy DimensionInfo while preserving metadata."""
+    return laspy.ExtraBytesParams(
+        name=name or dim_info.name,
+        type=dim_info.dtype,
+        description=getattr(dim_info, "description", "") or "",
+        offsets=getattr(dim_info, "offsets", None),
+        scales=getattr(dim_info, "scales", None),
+        no_data=getattr(dim_info, "no_data", None),
+    )
+
+
 # =============================================================================
 # Union-Find Data Structure
 # =============================================================================
@@ -1395,7 +1410,7 @@ def merge_small_volume_instances(
 def load_merged_file(
     merged_file: Path,
     chunk_size: int = 1_000_000,
-) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
+) -> Tuple[np.ndarray, Dict[str, np.ndarray], Dict[str, laspy.ExtraBytesParams]]:
     """
     Load merged point cloud data from an existing LAZ file.
     All dimensions except X,Y,Z are returned in one dict (standard + extra; no special "instance" dimension).
@@ -1406,7 +1421,9 @@ def load_merged_file(
         chunk_size: Number of points to read per chunk (default 1M)
 
     Returns:
-        Tuple of (points, all_dims) where all_dims contains every dimension in the file except X,Y,Z.
+        Tuple of (points, all_dims, extra_dim_params) where all_dims contains every
+        dimension in the file except X,Y,Z and extra_dim_params preserves metadata
+        for extra dimensions present in the merged file.
     """
     print(f"Loading existing merged file: {merged_file}")
 
@@ -1417,6 +1434,7 @@ def load_merged_file(
             n_points = f.header.point_count
             points = np.empty((n_points, 3), dtype=np.float64)
             all_dims: Dict[str, np.ndarray] = {}
+            extra_dim_params: Dict[str, laspy.ExtraBytesParams] = {}
             offset = 0
             for chunk in f.chunk_iterator(chunk_size):
                 chunk_len = len(chunk)
@@ -1435,6 +1453,8 @@ def load_merged_file(
                         all_dims[dim_name][offset:end] = arr
                 # Extra dimensions
                 for dim in f.header.point_format.extra_dimensions:
+                    if dim.name not in extra_dim_params:
+                        extra_dim_params[dim.name] = extra_bytes_params_from_dimension_info(dim)
                     if dim.name not in all_dims:
                         all_dims[dim.name] = np.zeros(n_points, dtype=dim.dtype)
                     all_dims[dim.name][offset:end] = getattr(chunk, dim.name)
@@ -1444,7 +1464,7 @@ def load_merged_file(
         if all_dims:
             print(f"  Dimensions from merged: {', '.join(sorted(all_dims.keys()))}")
 
-        return points, all_dims
+        return points, all_dims, extra_dim_params
 
     except Exception as e:
         raise ValueError(f"Error loading merged file {merged_file}: {e}")
@@ -1467,7 +1487,8 @@ def _process_single_tile(args):
         Tuple of (filename, matched_count, total_count, unique_instances, success, message)
     """
     (orig_file, output_file, merged_points, merged_instances, merged_extra_dims,
-     tolerance, spatial_buffer, kdtree_workers, instance_dimension) = args
+     merged_extra_dim_params, tolerance, spatial_buffer, kdtree_workers,
+     instance_dimension) = args
     
     try:
         with laspy.open(
@@ -1521,7 +1542,7 @@ def _process_single_tile(args):
         extra_dims_to_add = []
         for dim in orig_las.point_format.extra_dimensions:
             if dim.name not in output_extra_dim_names:
-                extra_dims_to_add.append(laspy.ExtraBytesParams(name=dim.name, type=dim.dtype))
+                extra_dims_to_add.append(extra_bytes_params_from_dimension_info(dim))
                 output_extra_dim_names.add(dim.name)
         
         if instance_dimension not in output_extra_dim_names:
@@ -1530,7 +1551,10 @@ def _process_single_tile(args):
         
         for dim_name, values in new_extras.items():
             if dim_name not in output_extra_dim_names:
-                extra_dims_to_add.append(laspy.ExtraBytesParams(name=dim_name, type=values.dtype))
+                if merged_extra_dim_params and dim_name in merged_extra_dim_params:
+                    extra_dims_to_add.append(merged_extra_dim_params[dim_name])
+                else:
+                    extra_dims_to_add.append(laspy.ExtraBytesParams(name=dim_name, type=values.dtype))
                 output_extra_dim_names.add(dim_name)
         
         if extra_dims_to_add:
@@ -1571,6 +1595,7 @@ def retile_to_original_files(
     merged_points: np.ndarray,
     merged_instances: np.ndarray,
     merged_extra_dims: Dict[str, np.ndarray],
+    merged_extra_dim_params: Optional[Dict[str, laspy.ExtraBytesParams]],
     original_tiles_dir: Path,
     output_dir: Path,
     tolerance: float = 0.1,
@@ -1640,7 +1665,8 @@ def retile_to_original_files(
     
     process_args = [
         (orig_file, output_file, merged_points, merged_instances, merged_extra_dims,
-         tolerance, spatial_buffer, kdtree_workers, instance_dimension)
+         merged_extra_dim_params, tolerance, spatial_buffer, kdtree_workers,
+         instance_dimension)
         for orig_file, output_file in tiles_to_process
     ]
 
@@ -1693,7 +1719,7 @@ def _process_single_original_input_file(args):
         Tuple of (filename, matched_count, total_count, unique_instances, success, message)
     """
     (input_file, output_file, merged_points, merged_extra_dims,
-     tolerance, spatial_buffer, kdtree_workers) = args
+     merged_extra_dim_params, tolerance, spatial_buffer, kdtree_workers) = args
     
     try:
         with laspy.open(
@@ -1745,6 +1771,23 @@ def _process_single_original_input_file(args):
         _, dims_to_overwrite = _dims_to_fill_from_source(
             merged_dtypes, target_dim_names, lambda n: getattr(input_las, n, None)
         )
+        # If merged range does not contain original range for a dimension, keep original (avoid rounding/loss)
+        for dim_name in list(dims_to_overwrite.keys()):
+            if dim_name not in new_extras:
+                continue
+            orig_arr = getattr(input_las, dim_name, None)
+            if orig_arr is None:
+                continue
+            orig_arr = np.asarray(orig_arr)
+            merged_arr = new_extras[dim_name]
+            omin, omax = float(np.min(orig_arr)), float(np.max(orig_arr))
+            mmin, mmax = float(np.min(merged_arr)), float(np.max(merged_arr))
+            if orig_arr.dtype.kind in "iu" and merged_arr.dtype.kind in "iu":
+                tol = 0
+            else:
+                tol = 1e-6 * (omax - omin + 1e-12)
+            if (omin < mmin - tol or omax > mmax + tol) or (np.isfinite(omin) and not np.isfinite(mmin)):
+                dims_to_overwrite.pop(dim_name, None)
 
         # Use standard point format (by id) so output keeps "original structure";
         # all merge-derived and any non-standard dims are added as extra dimensions only.
@@ -1774,7 +1817,7 @@ def _process_single_original_input_file(args):
         # Original extra dimensions -> add as extra
         for dim in input_las.point_format.extra_dimensions:
             if dim.name not in output_standard_dim_names and dim.name not in output_extra_dim_names:
-                extra_dims_to_add.append(laspy.ExtraBytesParams(name=dim.name, type=dim.dtype))
+                extra_dims_to_add.append(extra_bytes_params_from_dimension_info(dim))
                 output_extra_dim_names.add(dim.name)
         # Original "standard" dims that are not in the chosen standard format (custom format) -> add as extra
         for dim_name in input_las.point_format.dimension_names:
@@ -1785,13 +1828,16 @@ def _process_single_original_input_file(args):
         # Merge-derived dimensions -> always as extra
         for dim_name, values in new_extras.items():
             if dim_name not in output_standard_dim_names and dim_name not in output_extra_dim_names:
-                extra_dims_to_add.append(laspy.ExtraBytesParams(name=dim_name, type=values.dtype))
+                if merged_extra_dim_params and dim_name in merged_extra_dim_params:
+                    extra_dims_to_add.append(merged_extra_dim_params[dim_name])
+                else:
+                    extra_dims_to_add.append(laspy.ExtraBytesParams(name=dim_name, type=values.dtype))
                 output_extra_dim_names.add(dim_name)
 
         if extra_dims_to_add:
             output_las.add_extra_dims(extra_dims_to_add)
 
-        # Copy standard dimensions from original (or merged where we overwrite)
+        # Copy standard dimensions from original (or merged where we overwrite); keep original array/dtype to avoid rounding
         for dim_name in output_las.point_format.dimension_names:
             try:
                 if not hasattr(input_las, dim_name):
@@ -1832,9 +1878,51 @@ def _process_single_original_input_file(args):
         return (input_file.name, 0, 0, 0, False, str(e))
 
 
+def _validate_common_dimensions_minmax(original_path: Path, output_path: Path, rel_tol: float = 1e-5) -> None:
+    """Compare min/max of common dimensions between original and output; warn if they differ (rounding/loss)."""
+    try:
+        orig = laspy.read(str(original_path), laz_backend=laspy.LazBackend.LazrsParallel)
+        out = laspy.read(str(output_path), laz_backend=laspy.LazBackend.LazrsParallel)
+    except Exception as e:
+        print(f"  Validation skip: could not read files ({e})", flush=True)
+        return
+    try:
+        orig_names = set(orig.point_format.dimension_names) | {d.name for d in orig.point_format.extra_dimensions}
+        out_names = set(out.point_format.dimension_names) | {d.name for d in out.point_format.extra_dimensions}
+        common = orig_names & out_names - {"X", "Y", "Z"}
+        if not common:
+            return
+        diffs = []
+        for name in sorted(common):
+            oa = getattr(orig, name, None)
+            oo = getattr(out, name, None)
+            if oa is None or oo is None or len(oa) != len(oo):
+                continue
+            oa, oo = np.asarray(oa), np.asarray(oo)
+            omin, omax = float(np.min(oa)), float(np.max(oa))
+            wmin, wmax = float(np.min(oo)), float(np.max(oo))
+            if np.issubdtype(oa.dtype, np.integer) and np.issubdtype(oo.dtype, np.integer):
+                if (omin != wmin or omax != wmax) and (int(omin) != int(wmin) or int(omax) != int(wmax)):
+                    diffs.append((name, omin, omax, wmin, wmax))
+            else:
+                span = max(omax - omin, 1e-12)
+                if abs(omin - wmin) > rel_tol * span or abs(omax - wmax) > rel_tol * span:
+                    diffs.append((name, omin, omax, wmin, wmax))
+        if diffs:
+            print(f"  Warning: common dimensions min/max differ (output may have rounding/loss):", flush=True)
+            for name, omin, omax, wmin, wmax in diffs:
+                print(f"    {name}: original [{omin}, {omax}] vs output [{wmin}, {wmax}]", flush=True)
+            print(f"  Tip: dimensions above were not overwritten by merged where range would be lost.", flush=True)
+        del orig
+        del out
+    except Exception as e:
+        print(f"  Validation skip: {e}", flush=True)
+
+
 def remap_to_original_input_files(
     merged_points: np.ndarray,
     merged_extra_dims: Dict[str, np.ndarray],
+    merged_extra_dim_params: Optional[Dict[str, laspy.ExtraBytesParams]],
     original_input_dir: Path,
     output_dir: Path,
     tolerance: float = 0.1,
@@ -1905,29 +1993,49 @@ def remap_to_original_input_files(
     
     process_args = [
         (input_file, output_file, merged_points, merged_extra_dims,
-         tolerance, spatial_buffer, kdtree_workers)
+         merged_extra_dim_params, tolerance, spatial_buffer, kdtree_workers)
         for input_file, output_file in files_to_process
     ]
 
     total_matched = 0
     total_points = 0
-    
-    for i, args in enumerate(process_args):
-        result = _process_single_original_input_file(args)
-        filename, matched, total, unique_inst, success, message = result
-        
-        if success:
-            match_pct = (matched / total * 100) if total > 0 else 0
-            print(f"  [{i+1}/{len(files_to_process)}] {matched:,}/{total:,} matched ({match_pct:.1f}%), {unique_inst} instances → {filename}", flush=True)
-            total_matched += matched
-            total_points += total
-        else:
-            print(f"  [{i+1}/{len(files_to_process)}] FAILED: {message} → {filename}", flush=True)
-        
-        gc.collect()
+
+    # Use ThreadPoolExecutor: KDTree.query releases GIL so threads give real speedup
+    parallel_workers = min(num_threads, len(files_to_process)) if num_threads > 1 else 1
+    if parallel_workers > 1:
+        print(f"  Processing with {parallel_workers} parallel workers...", flush=True)
+        with ThreadPoolExecutor(max_workers=parallel_workers) as executor:
+            for i, result in enumerate(executor.map(_process_single_original_input_file, process_args)):
+                filename, matched, total, unique_inst, success, message = result
+                if success:
+                    match_pct = (matched / total * 100) if total > 0 else 0
+                    print(f"  [{i+1}/{len(files_to_process)}] {matched:,}/{total:,} matched ({match_pct:.1f}%), {unique_inst} instances → {filename}", flush=True)
+                    total_matched += matched
+                    total_points += total
+                else:
+                    print(f"  [{i+1}/{len(files_to_process)}] FAILED: {message} → {filename}", flush=True)
+    else:
+        for i, args in enumerate(process_args):
+            result = _process_single_original_input_file(args)
+            filename, matched, total, unique_inst, success, message = result
+            if success:
+                match_pct = (matched / total * 100) if total > 0 else 0
+                print(f"  [{i+1}/{len(files_to_process)}] {matched:,}/{total:,} matched ({match_pct:.1f}%), {unique_inst} instances → {filename}", flush=True)
+                total_matched += matched
+                total_points += total
+            else:
+                print(f"  [{i+1}/{len(files_to_process)}] FAILED: {message} → {filename}", flush=True)
+            gc.collect()
 
     overall_match_pct = (total_matched / total_points * 100) if total_points > 0 else 0
     print(f"\n  ✓ Remap complete: {len(files_to_process)} files, {total_matched:,}/{total_points:,} matched ({overall_match_pct:.1f}%)", flush=True)
+
+    # Validate: compare min/max of common dimensions between first output and original
+    if files_to_process and total_matched > 0:
+        first_input, first_output = files_to_process[0]
+        if first_output.exists():
+            _validate_common_dimensions_minmax(first_input, first_output)
+
     gc.collect()
 
 
@@ -2004,24 +2112,48 @@ def add_original_dimensions_to_merged(
         merged_dim_names.add(dim.name)
 
     skip_core = {"X", "Y", "Z"}
-    # Collect all dimensions present in originals (name -> dtype)
+    # Collect all dimensions present in originals with their real dtypes so we
+    # preserve packed flag fields and scaled extra dimensions.
     orig_dims: Dict[str, np.dtype] = {}
+    orig_extra_dim_info: Dict[str, object] = {}
     for orig_path in original_files:
-        las = laspy.read(str(orig_path), laz_backend=laspy.LazBackend.LazrsParallel)
-        for dim_name in las.point_format.dimension_names:
-            if dim_name in skip_core:
-                continue
-            if dim_name not in orig_dims:
-                arr = getattr(las, dim_name, None)
-                if arr is not None:
-                    orig_dims[dim_name] = arr.dtype
-        for dim in las.point_format.extra_dimensions:
-            if dim.name in skip_core:
-                continue
-            if dim.name not in orig_dims:
-                orig_dims[dim.name] = dim.dtype
-        del las
-        gc.collect()
+        with laspy.open(str(orig_path), laz_backend=laspy.LazBackend.LazrsParallel) as f:
+            pf = f.header.point_format
+            # Read one point so we can inspect laspy views for packed subfields like
+            # return_number / withheld as well as any scaled extra bytes.
+            pt_dtype = None
+            try:
+                one = f.read_points(1)
+                if one is not None and one.size > 0:
+                    arr = getattr(one, "array", one)
+                    dt = getattr(arr, "dtype", None)
+                    if dt is not None and getattr(dt, "names", None) is not None:
+                        pt_dtype = dt
+                if one is not None and one.size > 0:
+                    for dim_name in pf.dimension_names:
+                        if dim_name in skip_core or dim_name in orig_dims:
+                            continue
+                        dim_view = getattr(one, dim_name, None)
+                        if dim_view is not None and hasattr(dim_view, "dtype"):
+                            orig_dims[dim_name] = np.dtype(dim_view.dtype)
+                        elif pt_dtype is not None and dim_name in pt_dtype.names:
+                            orig_dims[dim_name] = pt_dtype.fields[dim_name][0]
+                else:
+                    one = None
+            except Exception:
+                one = None
+            if one is None or pt_dtype is None:
+                for dim_name in pf.dimension_names:
+                    if dim_name in skip_core or dim_name in orig_dims:
+                        continue
+                    orig_dims[dim_name] = np.float64
+            for dim in pf.extra_dimensions:
+                if dim.name in skip_core:
+                    continue
+                if dim.name not in orig_dims:
+                    orig_dims[dim.name] = dim.dtype
+                if dim.name not in orig_extra_dim_info:
+                    orig_extra_dim_info[dim.name] = dim
 
     # Reuse shared logic: which dims to add new and which to overwrite (empty/constant in target)
     dims_to_add_new, dims_to_overwrite = _dims_to_fill_from_source(
@@ -2096,14 +2228,16 @@ def add_original_dimensions_to_merged(
         if result is None:
             continue
         merged_idx, distances, orig_idx, orig_dim_arrays = result
-        for i in range(len(merged_idx)):
-            mi = merged_idx[i]
-            d = float(distances[i])
-            if d < best_dist[mi] and d <= max_dist:
-                best_dist[mi] = d
-                oi = int(orig_idx[i])
-                for dim_name, arr_np in orig_dim_arrays.items():
-                    new_arrays[dim_name][mi] = arr_np[oi]
+        # Vectorised best-distance update (replaces slow Python-level loop)
+        within_max = distances <= max_dist
+        better = distances < best_dist[merged_idx]
+        accept = within_max & better
+        if np.any(accept):
+            acc_merged = merged_idx[accept]
+            acc_orig = orig_idx[accept]
+            best_dist[acc_merged] = distances[accept]
+            for dim_name, arr_np in orig_dim_arrays.items():
+                new_arrays[dim_name][acc_merged] = arr_np[acc_orig]
     gc.collect()
 
     # Check min/max and warn if dimension is empty or constant
@@ -2118,12 +2252,21 @@ def add_original_dimensions_to_merged(
 
     # Only add new extra dims for dimensions not already in merged; overwrite existing in place
     if dims_to_add_new:
-        extra_params = [
-            laspy.ExtraBytesParams(name=name, type=dtype) for name, dtype in dims_to_add_new.items()
-        ]
+        extra_params = []
+        for name, dtype in dims_to_add_new.items():
+            if name in orig_extra_dim_info:
+                extra_params.append(
+                    extra_bytes_params_from_dimension_info(orig_extra_dim_info[name], name=name)
+                )
+            else:
+                extra_params.append(laspy.ExtraBytesParams(name=name, type=dtype))
         merged.add_extra_dims(extra_params)
     for name, arr in new_arrays.items():
-        setattr(merged, name, arr)
+        target_view = getattr(merged, name, None)
+        if target_view is not None and hasattr(target_view, "dtype"):
+            setattr(merged, name, np.asarray(arr, dtype=np.asarray(target_view).dtype))
+        else:
+            setattr(merged, name, arr)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     merged.write(str(output_path), do_compress=True, laz_backend=laspy.LazBackend.LazrsParallel)
@@ -2205,7 +2348,7 @@ def merge_tiles(
         print(f"{'=' * 60}")
         print("  Loading merged file and proceeding to retiling stage...")
         
-        merged_points, all_merged_dims = load_merged_file(output_merged)
+        merged_points, all_merged_dims, merged_extra_dim_params = load_merged_file(output_merged)
         # For retile we need (instances, extra_dims) split; for remap we pass all_merged_dims as-is
         if instance_dimension in all_merged_dims:
             merged_instances = all_merged_dims[instance_dimension]
@@ -2228,6 +2371,7 @@ def merge_tiles(
             merged_points,
             merged_instances,
             merged_extra_dims,
+            merged_extra_dim_params,
             original_tiles_dir,
             output_tiles_dir,
             tolerance=0.1,
@@ -2246,6 +2390,7 @@ def merge_tiles(
             remap_to_original_input_files(
                 merged_points,
                 all_merged_dims,
+                merged_extra_dim_params,
                 original_input_dir,
                 original_output_dir,
                 tolerance=retile_max_radius,
@@ -2473,7 +2618,7 @@ def merge_tiles(
         print(f"\n{'='*60}")
         print(f"DEBUG: Instance Pair Analysis")
         print(f"{'='*60}")
-        print(f"Instance {inst_id_a} ({tile_a_name}) <-> Instance {inst_id_b} ({tile_b.name})")
+        print(f"Instance {inst_id_a} ({tile_a_name}) <-> Instance {inst_id_b} ({tile_b_name})")
         print(f"Direction: {tile_a_name} ({direction}) <-> {tile_b_name} ({get_opposite_direction(direction)})")
         print(f"\nInstance {inst_id_a}:")
         print(f"  Tile: {tile_a_name}")
@@ -3513,6 +3658,7 @@ def merge_tiles(
         merged_points,
         merged_instances,
         merged_extra_dims,
+        None,
         original_tiles_dir,
         output_tiles_dir,
         tolerance=0.1,
@@ -3535,6 +3681,7 @@ def merge_tiles(
         remap_to_original_input_files(
             merged_points,
             all_merged_dims,
+            None,
             original_input_dir,
             original_output_dir,
             tolerance=0.1,
